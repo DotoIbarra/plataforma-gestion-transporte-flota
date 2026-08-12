@@ -154,7 +154,12 @@ function emptyDirty(){
   MODULE_ORDER.forEach(k => { d[k] = { upserts: new Set(), deletes: new Set() }; });
   return d;
 }
-let _dirty = emptyDirty();
+// OJO: no se puede llamar emptyDirty() acá todavía — usa MODULE_ORDER, que
+// se declara más abajo en el archivo (con "const", en temporal dead zone).
+// Llamarla en este punto rompía TODO el script al cargar la página (pantalla
+// en blanco). _dirty se inicializa de verdad más abajo, justo después de
+// declarar MODULE_ORDER.
+let _dirty = {};
 
 function markDirty(moduleKey, nro){
   if(moduleKey === "rutas") return; // rutas usa su propio upsert por fila (ver abajo)
@@ -633,6 +638,7 @@ const MODULES = {
 };
 
 const MODULE_ORDER = ["flota","rutas","fletes","mantenimiento","seguros","impuestos","multas","conductores","talleres"];
+_dirty = emptyDirty(); // recién acá MODULE_ORDER ya existe
 
 /* ==========================================================================
    RENDER: SIDEBAR
