@@ -110,33 +110,116 @@ async function fetchAllRows(table){
   return { data: all, error: null };
 }
 
-/* Inserta en bloques para no exceder el tamaño máximo de una sola petición
-   cuando se sincroniza un módulo con muchos registros (ej. import grande). */
-async function insertInChunks(table, rows, chunkSize = 500){
+/* Inserta/actualiza en bloques (para no exceder el tamaño máximo de una
+   sola petición) sin tocar el resto de la tabla. */
+async function upsertInChunks(table, rows, chunkSize = 500){
   for(let i = 0; i < rows.length; i += chunkSize){
     const chunk = rows.slice(i, i + chunkSize);
-    const { error } = await supabaseClient.from(table).insert(chunk);
+    const { error } = await supabaseClient.from(table).upsert(chunk, { onConflict: "nro" });
+    if(error) return error;
+  }
+  return null;
+}
+async function deleteNrosInChunks(table, nros, chunkSize = 500){
+  for(let i = 0; i < nros.length; i += chunkSize){
+    const chunk = nros.slice(i, i + chunkSize);
+    const { error } = await supabaseClient.from(table).delete().in("nro", chunk);
     if(error) return error;
   }
   return null;
 }
 
-async function syncModuleTable(moduleKey){
-  const rows = (DB[moduleKey] || []).map(r => sanitizeRowForDb(moduleKey, r));
-  const { error: delErr } = await supabaseClient.from(moduleKey).delete().gte("nro", 0);
-  if(delErr){ console.error("Supabase delete error", moduleKey, delErr); toast("Error al guardar " + moduleKey); return; }
-  if(rows.length){
-    const insErr = await insertInChunks(moduleKey, rows);
-    if(insErr){ console.error("Supabase insert error", moduleKey, insErr); toast("Error al guardar " + moduleKey); }
+/* ==========================================================================
+   SINCRONIZACIÓN INCREMENTAL (reemplaza el viejo patrón "borrar todo +
+   reinsertar todo").
+   -----------------------------------------------------------------------
+   ANTES: cada guardado borraba la tabla completa de un módulo y la volvía a
+   insertar entera a partir de lo que esa pestaña tenía en memoria. Eso es
+   catastrófico si la pestaña quedó con una copia vieja (por ejemplo, abierta
+   desde antes de una importación grande, o simplemente abierta desde el día
+   anterior): cualquier guardado posterior —incluso de una edición chica en
+   otro módulo, o del espejo automático rutas→fletes que corre solo al
+   recibir eventos en vivo— borraba y reescribía TODA la tabla con esa copia
+   vieja, haciendo "desaparecer" todo lo agregado después (como un import de
+   Excel) sin que nadie lo borrara a propósito.
+
+   AHORA: cada módulo lleva un registro de qué filas (por "nro") cambiaron
+   en ESTA pestaña desde el último guardado exitoso (_dirty). Al guardar,
+   solo se hace upsert de esas filas puntuales y delete de los nro
+   explícitamente eliminados — nunca un "delete de todo". Así, una pestaña
+   con datos viejos de OTRAS filas jamás puede borrarlas: solo puede tocar
+   las filas que ella misma modificó. */
+function emptyDirty(){
+  const d = {};
+  MODULE_ORDER.forEach(k => { d[k] = { upserts: new Set(), deletes: new Set() }; });
+  return d;
+}
+let _dirty = emptyDirty();
+
+function markDirty(moduleKey, nro){
+  if(moduleKey === "rutas") return; // rutas usa su propio upsert por fila (ver abajo)
+  _dirty[moduleKey].deletes.delete(Number(nro));
+  _dirty[moduleKey].upserts.add(Number(nro));
+}
+function markDeleted(moduleKey, nro){
+  if(moduleKey === "rutas") return;
+  _dirty[moduleKey].upserts.delete(Number(nro));
+  _dirty[moduleKey].deletes.add(Number(nro));
+}
+
+/* Sincroniza SOLO las filas de un módulo marcadas como cambiadas. Si algo
+   falla, las deja pendientes (no las borra de _dirty) para reintentar en el
+   próximo guardado, en vez de darlas por perdidas. */
+async function flushModule(moduleKey){
+  const dirty = _dirty[moduleKey];
+  if(!dirty) return;
+  const upsertNros = [...dirty.upserts];
+  const deleteNros = [...dirty.deletes];
+  if(!upsertNros.length && !deleteNros.length) return;
+
+  if(upsertNros.length){
+    const rows = upsertNros
+      .map(nro => (DB[moduleKey] || []).find(r => Number(r.nro) === nro))
+      .filter(Boolean)
+      .map(r => sanitizeRowForDb(moduleKey, r));
+    if(rows.length){
+      const err = await upsertInChunks(moduleKey, rows);
+      if(err){ console.error("Supabase upsert error", moduleKey, err); toast("Error al guardar " + moduleKey); return; }
+    }
+    upsertNros.forEach(n => dirty.upserts.delete(n));
+  }
+  if(deleteNros.length){
+    const err = await deleteNrosInChunks(moduleKey, deleteNros);
+    if(err){ console.error("Supabase delete error", moduleKey, err); toast("Error al eliminar en " + moduleKey); return; }
+    deleteNros.forEach(n => dirty.deletes.delete(n));
   }
 }
 
+/* Restaurar un respaldo completo (el JSON exportado con "Exportar todo") SÍ
+   debe reemplazar el contenido entero de cada tabla — pero es una acción
+   explícita y deliberada del usuario al elegir ese archivo, muy distinta a
+   que un guardado cualquiera borre todo como efecto secundario. Aun así, en
+   vez de un "delete de todo" ciego, se calcula qué filas del servidor no
+   están en el respaldo (para borrarlas) y se hace upsert del resto, para
+   minimizar la ventana en la que la tabla queda vacía. */
+async function restoreFullBackup(payload){
+  DB = payload.data;
+  CAT = payload.catalogos;
+  await Promise.all(MODULE_ORDER.map(async key => {
+    const { data: existing, error } = await supabaseClient.from(key).select("nro");
+    const existingNros = (!error && existing) ? existing.map(r => Number(r.nro)) : [];
+    const newNros = new Set((DB[key] || []).map(r => Number(r.nro)));
+    const toDelete = existingNros.filter(n => !newNros.has(n));
+    _dirty[key] = { upserts: new Set(newNros), deletes: new Set(toDelete) };
+  }));
+  await persistDB(); // pasa por la cola _dbWriteChain, igual que cualquier otro guardado
+  await persistCat();
+}
+
 /* "rutas" es la única tabla que también escriben los conductores desde su
-   propia app (con su sesión, en paralelo al panel web). Por eso NUNCA se
-   sincroniza con el patrón "borrar todo + reinsertar todo" que usan los
-   demás módulos (eso borraría rutas creadas por un conductor mientras el
-   panel tenía cargada una copia desactualizada). En vez de eso, cada
-   cambio hecho desde el panel escribe solo la fila que cambió. */
+   propia app (con su sesión, en paralelo al panel web). Por eso siempre
+   usó upsert por fila (nunca el patrón "borrar todo"), igual que ahora
+   hacen todos los demás módulos. */
 async function upsertRutaRow(row){
   const payload = sanitizeRowForDb("rutas", row);
   payload.conductorAuthId = await fetchAuthIdDeConductor(row.conductor);
@@ -187,13 +270,12 @@ async function loadDB(){
   if(map[LS_LOG]){ LOG = map[LS_LOG]; }
   else { LOG = []; await persistLog(); }
 }
-/* persistDB hace "borrar todo + reinsertar todo" por tabla (syncModuleTable).
-   Si dos llamadas a persistDB corren en paralelo (p. ej. dos importaciones
-   seguidas sin esperar la primera, o una importación mientras llega un
-   evento realtime de rutas), el "borrar" de una puede ejecutarse justo
-   después del "insertar" de la otra y dejar la tabla con menos datos de
-   los que debería (el import anterior "desaparece"). _dbWriteChain encola
-   cada llamada para que se ejecuten una por una, nunca en paralelo. */
+/* persistDB ahora solo sincroniza filas puntuales marcadas como cambiadas
+   (ver flushModule más arriba) — ya no hay ningún "borrar todo" salvo en
+   resetAll(), que es una acción explícita y confirmada por el usuario.
+   Se mantiene la cola _dbWriteChain para que los guardados se ejecuten uno
+   por uno (evita condiciones de carrera al escribir), pero al ser
+   incremental, aunque se solaparan no podrían borrar datos ajenos. */
 let _dbWriteChain = Promise.resolve();
 function persistDB(opts={}){
   _dbWriteChain = _dbWriteChain.then(() => reallyPersistDB(opts)).catch(err => {
@@ -204,7 +286,7 @@ function persistDB(opts={}){
 }
 async function reallyPersistDB(opts={}){
   const keys = opts.skipRutas ? MODULE_ORDER.filter(k => k !== "rutas") : MODULE_ORDER;
-  await Promise.all(keys.map(syncModuleTable));
+  await Promise.all(keys.map(flushModule));
   markSaved();
 }
 async function persistCat(){ await saveKey(LS_CAT, CAT); markSaved(); }
@@ -217,10 +299,20 @@ function logActivity(moduleKey, action, nro, summary){
   persistLog();
 }
 
-function nextNro(moduleKey){
-  const rows = DB[moduleKey];
-  if(!rows.length) return 1;
-  return Math.max(...rows.map(r=>Number(r.nro)||0)) + 1;
+/* ANTES: nextNro() calculaba max(nro)+1 solo con la copia en memoria de
+   ESTA pestaña. Si otra sesión había agregado registros que esta pestaña
+   no tenía cargados (por ejemplo, un import grande hecho en otra pestaña),
+   el próximo nro calculado acá podía coincidir con uno ya usado allá y, al
+   guardar, pisar ese registro ajeno. Ahora se consulta primero el máximo
+   real en la base de datos y se toma el mayor entre ese valor y el local. */
+async function nextNroSafe(moduleKey){
+  const { data, error } = await supabaseClient
+    .from(moduleKey).select("nro").order("nro", { ascending: false }).limit(1);
+  if(error) console.error("Supabase nro fetch error", moduleKey, error);
+  const serverMax = (!error && data && data.length) ? Number(data[0].nro) || 0 : 0;
+  const rows = DB[moduleKey] || [];
+  const localMax = rows.length ? Math.max(...rows.map(r => Number(r.nro) || 0)) : 0;
+  return Math.max(serverMax, localMax) + 1;
 }
 
 /* ---------------------------------------------------------------- fórmulas (calculadas, igual que el Excel original) */
@@ -269,7 +361,7 @@ function fleteDataFromRuta(ruta){
   };
 }
 
-function syncFleteFromRuta(ruta){
+async function syncFleteFromRuta(ruta){
   const idx = DB.fletes.findIndex(f => Number(f.rutaNro) === Number(ruta.nro));
   const data = fleteDataFromRuta(ruta);
   if(idx !== -1){
@@ -279,19 +371,24 @@ function syncFleteFromRuta(ruta){
     // n° repor/guía/factura) no se tocan aquí para no perder lo que el
     // usuario ya cargó.
     DB.fletes[idx] = { ...DB.fletes[idx], ...data };
+    markDirty("fletes", DB.fletes[idx].nro);
   } else {
-    data.nro = nextNro("fletes");
+    data.nro = await nextNroSafe("fletes");
     data.tipoFlete = "";
     data.nroRepor = "";
     data.nroGuia = "";
     data.nroFactura = "";
     DB.fletes.push(data);
+    markDirty("fletes", data.nro);
   }
 }
 
 function removeFleteForRuta(rutaNro){
   const idx = DB.fletes.findIndex(f => Number(f.rutaNro) === Number(rutaNro));
-  if(idx !== -1) DB.fletes.splice(idx, 1);
+  if(idx !== -1){
+    const [removed] = DB.fletes.splice(idx, 1);
+    markDeleted("fletes", removed.nro);
+  }
 }
 
 const MESES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
@@ -1209,6 +1306,7 @@ async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {})
     const idx = DB[moduleKey].findIndex(r => String(r.nro) === String(editing.nro));
     DB[moduleKey][idx] = { ...DB[moduleKey][idx], ...data };
     savedRow = DB[moduleKey][idx];
+    markDirty(moduleKey, savedRow.nro);
     toast("Registro actualizado");
   } else if(moduleKey === "rutas"){
     // El nro lo entrega la base de datos (secuencia rutas_nro_seq), nunca
@@ -1224,13 +1322,17 @@ async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {})
     savedRow = data;
     toast("Registro creado");
   } else {
-    data.nro = nextNro(moduleKey);
+    // Igual que rutas: se consulta el máximo real en la base antes de
+    // asignar el próximo número, para no pisar un registro creado en otra
+    // sesión que esta pestaña todavía no tiene cargado en memoria.
+    data.nro = await nextNroSafe(moduleKey);
     DB[moduleKey].push(data);
     savedRow = data;
+    markDirty(moduleKey, savedRow.nro);
     toast("Registro creado");
   }
   if(moduleKey === "rutas"){
-    syncFleteFromRuta(savedRow);
+    await syncFleteFromRuta(savedRow);
     if(isUpdate) upsertRutaRow(savedRow); // si es nuevo, ya se insertó arriba
   }
   persistDB({ skipRutas: moduleKey === "rutas" });
@@ -1275,11 +1377,12 @@ function confirmDelete(moduleKey, nro){
   $("#modalClose").addEventListener("click", closeModal);
   $("#btnCancel").addEventListener("click", closeModal);
   $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
-  $("#btnConfirmDel").addEventListener("click", ()=>{
+  $("#btnConfirmDel").addEventListener("click", async ()=>{
     const idx = DB[moduleKey].findIndex(r => String(r.nro) === String(nro));
     if(idx === -1){ closeModal(); return; }
     const [removed] = DB[moduleKey].splice(idx, 1);
     if(moduleKey === "rutas"){ removeFleteForRuta(removed.nro); deleteRutaRow(removed.nro); }
+    else { markDeleted(moduleKey, removed.nro); }
     const trashId = uid();
     TRASH[moduleKey].push({ ...removed, _trashId: trashId, _deletedAt: new Date().toISOString() });
     persistDB({ skipRutas: moduleKey === "rutas" }); persistTrash();
@@ -1292,16 +1395,17 @@ function confirmDelete(moduleKey, nro){
 }
 
 /* ---------------------------------------------------------------- PAPELERA (registros eliminados) */
-function restoreFromTrash(moduleKey, trashId){
+async function restoreFromTrash(moduleKey, trashId){
   const idx = TRASH[moduleKey].findIndex(t => t._trashId === trashId);
   if(idx === -1){ toast("Ese registro ya no está en la papelera"); return; }
   const [item] = TRASH[moduleKey].splice(idx, 1);
   delete item._trashId;
   const deletedAt = item._deletedAt;
   delete item._deletedAt;
-  if(DB[moduleKey].some(r => String(r.nro) === String(item.nro))) item.nro = nextNro(moduleKey);
+  if(DB[moduleKey].some(r => String(r.nro) === String(item.nro))) item.nro = await nextNroSafe(moduleKey);
   DB[moduleKey].push(item);
-  if(moduleKey === "rutas"){ syncFleteFromRuta(item); upsertRutaRow(item); }
+  if(moduleKey === "rutas"){ await syncFleteFromRuta(item); upsertRutaRow(item); }
+  else { markDirty(moduleKey, item.nro); }
   persistDB({ skipRutas: moduleKey === "rutas" }); persistTrash();
   logActivity(moduleKey, "restore", item.nro, MODULES[moduleKey].summary ? MODULES[moduleKey].summary(item) : `#${item.nro}`);
   toast("Registro restaurado");
@@ -1849,7 +1953,7 @@ function rowSignature(cfg, row){
   return moduleDedupeFields(cfg).map(k => normalizeHeader(row[k])).join("§");
 }
 
-function importObjectsIntoModule(moduleKey, objects, defaults={}){
+async function importObjectsIntoModule(moduleKey, objects, defaults={}){
   const cfg = MODULES[moduleKey];
   const lookup = buildFieldLookup(cfg);
   // Firma de todo lo que ya existe en el módulo, para no duplicar fletes
@@ -1858,7 +1962,12 @@ function importObjectsIntoModule(moduleKey, objects, defaults={}){
   // así tampoco se duplican dos filas iguales dentro del mismo archivo.
   const seen = new Set(DB[moduleKey].map(r => rowSignature(cfg, r)));
   let added = 0, skipped = 0, duplicated = 0;
-  objects.forEach(obj => {
+  // El contador de nro arranca del máximo real en la base de datos (no solo
+  // de lo que esta pestaña tiene cargado), igual que nextNroSafe, pero se
+  // consulta UNA sola vez y después se incrementa en memoria para no hacer
+  // una consulta de red por cada una de las 500+ filas del import.
+  let nextNroCounter = null;
+  for(const obj of objects){
     const row = {};
     Object.keys(obj).forEach(h => {
       const key = lookup[normalizeHeader(h)];
@@ -1874,12 +1983,14 @@ function importObjectsIntoModule(moduleKey, objects, defaults={}){
       }
     });
     const missingRequired = cfg.columns.some(c => c.required && c.kind !== "computed" && (row[c.key] === undefined || row[c.key] === ""));
-    if(missingRequired || Object.keys(row).length === 0){ skipped++; return; }
+    if(missingRequired || Object.keys(row).length === 0){ skipped++; continue; }
     const sig = rowSignature(cfg, row);
-    if(seen.has(sig)){ duplicated++; return; }
+    if(seen.has(sig)){ duplicated++; continue; }
     seen.add(sig);
-    row.nro = nextNro(moduleKey);
+    if(nextNroCounter === null) nextNroCounter = await nextNroSafe(moduleKey);
+    row.nro = nextNroCounter++;
     DB[moduleKey].push(row);
+    markDirty(moduleKey, row.nro);
     // Catálogos dinámicos: registra valores nuevos (p. ej. Obra) para que
     // queden disponibles después en el desplegable de sugerencias.
     cfg.columns.forEach(c => {
@@ -1889,7 +2000,7 @@ function importObjectsIntoModule(moduleKey, objects, defaults={}){
       }
     });
     added++;
-  });
+  }
   if(added) persistCat();
   return { added, skipped, duplicated };
 }
@@ -2000,14 +2111,16 @@ async function handleImportFile(file, targetModule){
   if(result.type === "json"){
     const payload = result.payload;
     if(payload && payload.data && payload.catalogos){
-      DB = payload.data; CAT = payload.catalogos;
-      await persistDB();
-      await persistCat();
+      // Restaurar un respaldo completo SÍ reemplaza toda la base — pero es
+      // una acción explícita y deliberada del usuario (no un efecto
+      // secundario de guardar un registro suelto), así que usa su propia
+      // función que calcula la diferencia real contra el servidor.
+      await restoreFullBackup(payload);
       return { added:0, skipped:0, duplicated:0, backup:true };
     }
     if(Array.isArray(payload)){
       if(!targetModule) throw new Error(`Elige un módulo destino para "${file.name}"`);
-      const { added, skipped, duplicated } = importObjectsIntoModule(targetModule, payload);
+      const { added, skipped, duplicated } = await importObjectsIntoModule(targetModule, payload);
       await persistDB();
       return { added, skipped, duplicated };
     }
@@ -2018,14 +2131,14 @@ async function handleImportFile(file, targetModule){
   const sheetNames = Object.keys(result.sheets);
   if(!targetModule){
     let totalAdded = 0, totalSkipped = 0, totalDup = 0, matchedAny = false;
-    sheetNames.forEach(sn => {
+    for(const sn of sheetNames){
       const modKey = MODULE_ORDER.find(k => normalizeHeader(MODULES[k].label) === normalizeHeader(sn) || normalizeHeader(k) === normalizeHeader(sn));
       if(modKey){
         matchedAny = true;
-        const { added, skipped, duplicated } = importObjectsIntoModule(modKey, result.sheets[sn]);
+        const { added, skipped, duplicated } = await importObjectsIntoModule(modKey, result.sheets[sn]);
         totalAdded += added; totalSkipped += skipped; totalDup += duplicated;
       }
-    });
+    }
     if(!matchedAny) throw new Error(`No se reconoció ningún módulo en las hojas de "${file.name}". Elige un módulo destino.`);
     await persistDB();
     return { added: totalAdded, skipped: totalSkipped, duplicated: totalDup };
@@ -2037,16 +2150,16 @@ async function handleImportFile(file, targetModule){
     // de la hoja como valor del campo indicado (p. ej. "obra" en Fletes), salvo
     // que la fila ya traiga ese dato (p. ej. una columna "Obra" con datos reales).
     let totalAdded = 0, totalSkipped = 0, totalDup = 0;
-    sheetNames.forEach(sn => {
-      const { added, skipped, duplicated } = importObjectsIntoModule(targetModule, result.sheets[sn], { [cfg.sheetAsField]: sn });
+    for(const sn of sheetNames){
+      const { added, skipped, duplicated } = await importObjectsIntoModule(targetModule, result.sheets[sn], { [cfg.sheetAsField]: sn });
       totalAdded += added; totalSkipped += skipped; totalDup += duplicated;
-    });
+    }
     await persistDB();
     return { added: totalAdded, skipped: totalSkipped, duplicated: totalDup };
   }
 
   const data = result.sheets[sheetNames[0]] || [];
-  const { added, skipped, duplicated } = importObjectsIntoModule(targetModule, data);
+  const { added, skipped, duplicated } = await importObjectsIntoModule(targetModule, data);
   await persistDB();
   return { added, skipped, duplicated };
 }
@@ -2146,6 +2259,7 @@ async function resetAll(){
   if(failedTable){ console.error("Supabase delete error", failedTable.error); toast("Error al borrar los datos"); return; }
   const { error } = await supabaseClient.from(STORAGE_TABLE).delete().in("key", [LS_CAT, LS_TRASH, LS_LOG]);
   if(error){ console.error("Supabase delete error", error); toast("Error al borrar los datos"); return; }
+  _dirty = emptyDirty();
   await loadDB();
   goTo("dashboard");
   toast("Todos los datos fueron borrados");
@@ -2207,7 +2321,7 @@ function watchRutasRealtime(){
    que si el admin la hubiera guardado a mano. */
 async function syncClosedRoutesToFletes(){
   let changed = false;
-  DB.rutas.forEach(r => {
+  for(const r of DB.rutas){
     const existingFlete = DB.fletes.find(f => Number(f.rutaNro) === Number(r.nro));
     if(existingFlete){
       // El flete espejo ya existía (por ejemplo, el admin guardó la ruta
@@ -2220,17 +2334,20 @@ async function syncClosedRoutesToFletes(){
       const data = fleteDataFromRuta(r);
       const huboCambios = Object.keys(data).some(k => existingFlete[k] !== data[k]);
       if(huboCambios){
-        syncFleteFromRuta(r);
+        await syncFleteFromRuta(r);
         changed = true;
       }
     } else if(r.fotoFin){
       // Ruta recién cerrada (tiene Report) y todavía sin fila espejo: se crea.
-      syncFleteFromRuta(r);
+      await syncFleteFromRuta(r);
       const flete = DB.fletes.find(f => Number(f.rutaNro) === Number(r.nro));
       if(flete) logActivity("fletes", "create", flete.nro, MODULES.fletes.summary ? MODULES.fletes.summary(flete) : `#${flete.nro}`);
       changed = true;
     }
-  });
+  }
   if(!changed) return;
+  // Ahora esto solo hace upsert de las filas puntuales de fletes que
+  // cambiaron acá — nunca vuelve a tocar el resto de las tablas, aunque
+  // esta pestaña lleve horas abierta y tenga datos viejos de otros módulos.
   await persistDB({ skipRutas: true });
 }
