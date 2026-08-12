@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Control de Flota Vehicular</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚚</text></svg>">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><span>CF</span></div>
+      <div class="brand-text">
+        <b>Control Flota</b>
+        <small>Gestión vehicular</small>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidebar-foot">
+      <div class="save-indicator" id="saveIndicator">✓ Guardado automáticamente</div>
+      Todos los cambios se guardan solos en este navegador (localStorage).
+      <button id="btnReset">↺ Borrar todos los datos</button>
+    </div>
+  </aside>
+
+  <main class="main" id="main"></main>
+</div>
+
+<div id="modalRoot"></div>
+<div class="toast" id="toast"></div>
+
+<!-- xlsx-js-style: mismo motor que SheetJS Community (0.18.5) más soporte para
+     ESCRIBIR estilos de celda (negrita, colores, bordes) en el Excel exportado.
+     La SheetJS gratuita estándar solo permite leer estilos, no escribirlos. -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="js/supabase-config.js"></script>
+<script src="js/data.js"></script>
+<script src="js/app.js?v=2"></script>
+</body>
+</html>
