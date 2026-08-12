@@ -69,8 +69,17 @@ function emptyTrash(){
 function sanitizeRowForDb(moduleKey, row){
   const cfg = MODULES[moduleKey];
   const out = { nro: Number(row.nro) };
-  if(moduleKey === "fletes" && row.rutaNro !== undefined && row.rutaNro !== null && row.rutaNro !== ""){
-    out.rutaNro = Number(row.rutaNro);
+  if(moduleKey === "fletes"){
+    // IMPORTANTE: esta clave debe estar SIEMPRE presente (con null si no
+    // aplica), nunca omitida condicionalmente. Cuando se guardan varias
+    // filas juntas en un mismo lote (import de Excel, guardado incremental,
+    // etc.), PostgREST exige que TODOS los objetos del lote tengan
+    // exactamente las mismas columnas — si a algunas filas les falta esta
+    // clave (p. ej. fletes importados por Excel, que no vienen de una ruta)
+    // y a otras no, Supabase rechaza el lote ENTERO con error 400 ("All
+    // object keys must match"), y esas filas nunca llegan a guardarse.
+    out.rutaNro = (row.rutaNro !== undefined && row.rutaNro !== null && row.rutaNro !== "")
+      ? Number(row.rutaNro) : null;
   }
   if(moduleKey === "rutas"){
     // Enlaza la ruta con la cuenta del conductor elegido en el selector,
@@ -1937,7 +1946,14 @@ function coerceValue(col, raw){
     else {
       const s = String(v).trim();
       const d = new Date(s);
-      v = isNaN(d.getTime()) ? s : d.toISOString().slice(0,10);
+      // Antes, si el texto no se podía interpretar como fecha (por ejemplo
+      // alguien escribió "Realizado" en la celda en vez de una fecha), acá
+      // se guardaba el texto crudo tal cual (v = s). Ese texto después se
+      // mandaba directo a una columna "date" de Postgres, que lo rechazaba
+      // con el error 22007 ("invalid input syntax for type date") y
+      // frenaba TODO el lote de guardado. Ahora, si no es una fecha válida,
+      // queda vacío en vez de un texto que la base de datos va a rechazar.
+      v = isNaN(d.getTime()) ? "" : d.toISOString().slice(0,10);
     }
   } else if(col.kind === "image"){
     v = (typeof v === "string" && v.startsWith("data:image")) ? v : "";
@@ -2305,15 +2321,57 @@ document.addEventListener("DOMContentLoaded", async () => {
    recarga solo la tabla "rutas" desde Supabase y refresca la pantalla si
    corresponde — sin que nadie tenga que apretar F5. */
 function watchRutasRealtime(){
-  supabaseClient
-    .channel("rutas-espejo")
-    .on("postgres_changes", { event: "*", schema: "public", table: "rutas" }, async () => {
+  // Postgres manda un evento realtime POR CADA FILA que cambia. Sin debounce,
+  // una ráfaga de N cambios (varias fotos subidas seguidas, una importación,
+  // varias pestañas escribiendo casi a la vez) disparaba N recargas
+  // completas de la tabla "rutas" EN PARALELO, todas compitiendo por los
+  // mismos recursos de Postgres — eso era lo que terminaba superando el
+  // statement_timeout (error 57014) y llenando la consola de reintentos.
+  // Ahora se agrupan todos los eventos que lleguen dentro de una ventana
+  // corta en UNA sola recarga, que se dispara recién cuando la ráfaga
+  // termina (o como máximo cada MAX_WAIT_MS si los eventos no paran).
+  const DEBOUNCE_MS = 800;
+  const MAX_WAIT_MS = 4000;
+  let debounceTimer = null;
+  let maxWaitTimer = null;
+  let reloading = false;
+  let reloadAgainAfter = false;
+
+  async function doReload(){
+    if(reloading){ reloadAgainAfter = true; return; } // ya hay una recarga en curso: pedir otra al terminar
+    reloading = true;
+    try{
       const { data, error } = await fetchAllRows("rutas");
       if(error){ console.error("Supabase realtime reload error", error); return; }
       DB.rutas = data || [];
       await syncClosedRoutesToFletes();
       if(["rutas", "dashboard", "fletes"].includes(currentModule)) renderMain();
-    })
+    } finally {
+      reloading = false;
+      if(reloadAgainAfter){ reloadAgainAfter = false; scheduleReload(); }
+    }
+  }
+
+  function scheduleReload(){
+    if(debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      clearTimeout(maxWaitTimer);
+      maxWaitTimer = null;
+      doReload();
+    }, DEBOUNCE_MS);
+    if(!maxWaitTimer){
+      maxWaitTimer = setTimeout(() => {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+        maxWaitTimer = null;
+        doReload();
+      }, MAX_WAIT_MS);
+    }
+  }
+
+  supabaseClient
+    .channel("rutas-espejo")
+    .on("postgres_changes", { event: "*", schema: "public", table: "rutas" }, scheduleReload)
     .subscribe();
 }
 
