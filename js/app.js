@@ -187,7 +187,22 @@ async function loadDB(){
   if(map[LS_LOG]){ LOG = map[LS_LOG]; }
   else { LOG = []; await persistLog(); }
 }
-async function persistDB(opts={}){
+/* persistDB hace "borrar todo + reinsertar todo" por tabla (syncModuleTable).
+   Si dos llamadas a persistDB corren en paralelo (p. ej. dos importaciones
+   seguidas sin esperar la primera, o una importación mientras llega un
+   evento realtime de rutas), el "borrar" de una puede ejecutarse justo
+   después del "insertar" de la otra y dejar la tabla con menos datos de
+   los que debería (el import anterior "desaparece"). _dbWriteChain encola
+   cada llamada para que se ejecuten una por una, nunca en paralelo. */
+let _dbWriteChain = Promise.resolve();
+function persistDB(opts={}){
+  _dbWriteChain = _dbWriteChain.then(() => reallyPersistDB(opts)).catch(err => {
+    console.error("Supabase persist error", err);
+    toast("Error al guardar los datos");
+  });
+  return _dbWriteChain;
+}
+async function reallyPersistDB(opts={}){
   const keys = opts.skipRutas ? MODULE_ORDER.filter(k => k !== "rutas") : MODULE_ORDER;
   await Promise.all(keys.map(syncModuleTable));
   markSaved();
@@ -513,6 +528,10 @@ const MODULES = {
       { key:"anio", label:"Año" },
       { key:"solicitadoPor", label:"Solicitado por" },
     ],
+    // Campos que definen si dos fletes son "el mismo" al importar. Si un
+    // registro nuevo coincide en todos estos campos con uno que ya existe
+    // (o con otro dentro del mismo archivo), se omite en vez de duplicarlo.
+    dedupeFields: ["obra","descripcion","realizado","lugar","nroRepor","nroGuia","valorFlete"],
   },
 };
 
@@ -1819,10 +1838,26 @@ function coerceValue(col, raw){
   return v;
 }
 
+/* Campos que se usan para decidir si dos registros son "el mismo flete".
+   Si el módulo define cfg.dedupeFields se usan esos; si no, se usan todos
+   los campos importables (sin contar calculados ni fotos). */
+function moduleDedupeFields(cfg){
+  if(cfg.dedupeFields) return cfg.dedupeFields;
+  return cfg.columns.filter(c => c.kind !== "computed" && c.kind !== "image").map(c => c.key);
+}
+function rowSignature(cfg, row){
+  return moduleDedupeFields(cfg).map(k => normalizeHeader(row[k])).join("§");
+}
+
 function importObjectsIntoModule(moduleKey, objects, defaults={}){
   const cfg = MODULES[moduleKey];
   const lookup = buildFieldLookup(cfg);
-  let added = 0, skipped = 0;
+  // Firma de todo lo que ya existe en el módulo, para no duplicar fletes
+  // que coincidan con uno ya cargado (de este archivo o de una importación
+  // anterior). Se va actualizando a medida que se agregan filas nuevas,
+  // así tampoco se duplican dos filas iguales dentro del mismo archivo.
+  const seen = new Set(DB[moduleKey].map(r => rowSignature(cfg, r)));
+  let added = 0, skipped = 0, duplicated = 0;
   objects.forEach(obj => {
     const row = {};
     Object.keys(obj).forEach(h => {
@@ -1840,6 +1875,9 @@ function importObjectsIntoModule(moduleKey, objects, defaults={}){
     });
     const missingRequired = cfg.columns.some(c => c.required && c.kind !== "computed" && (row[c.key] === undefined || row[c.key] === ""));
     if(missingRequired || Object.keys(row).length === 0){ skipped++; return; }
+    const sig = rowSignature(cfg, row);
+    if(seen.has(sig)){ duplicated++; return; }
+    seen.add(sig);
     row.nro = nextNro(moduleKey);
     DB[moduleKey].push(row);
     // Catálogos dinámicos: registra valores nuevos (p. ej. Obra) para que
@@ -1853,7 +1891,59 @@ function importObjectsIntoModule(moduleKey, objects, defaults={}){
     added++;
   });
   if(added) persistCat();
-  return { added, skipped };
+  return { added, skipped, duplicated };
+}
+
+/* Conjunto de todos los encabezados conocidos (nombre de columna + label +
+   alias) de todos los módulos, en minúsculas. Sirve para reconocer en qué
+   fila de la hoja está realmente el encabezado de la tabla, sin asumir que
+   es la fila 1: algunos Excel traen membrete/título/logo en las primeras
+   filas (p. ej. "TRANSPORTE ... Rut ...") y la tabla empieza más abajo. */
+function buildKnownHeaderSet(){
+  const set = new Set();
+  MODULE_ORDER.forEach(k => {
+    MODULES[k].columns.filter(c => c.kind !== "computed").forEach(c => {
+      set.add(normalizeHeader(c.key));
+      set.add(normalizeHeader(c.label));
+      (c.aliases || []).forEach(a => set.add(normalizeHeader(a)));
+    });
+  });
+  return set;
+}
+const KNOWN_HEADERS = buildKnownHeaderSet();
+
+function detectHeaderRowIndex(rawRows, knownHeaders, maxScan=20){
+  let best = 0, bestScore = -1;
+  const limit = Math.min(maxScan, rawRows.length);
+  for(let i=0; i<limit; i++){
+    const row = rawRows[i] || [];
+    const score = row.filter(cell => knownHeaders.has(normalizeHeader(cell))).length;
+    if(score > bestScore){ bestScore = score; best = i; }
+  }
+  // Si ninguna fila tuvo al menos 2 coincidencias con encabezados conocidos,
+  // se asume que el archivo ya viene "limpio" y la fila 1 es el encabezado
+  // (comportamiento anterior, para no romper archivos ya usados hoy).
+  return bestScore >= 2 ? best : 0;
+}
+
+/* Convierte una hoja/archivo ya leído como filas crudas (array de arrays,
+   como delvuelve Excel con {header:1} o un CSV parseado) en objetos
+   {encabezado: valor}, saltando cualquier fila de título/membrete antes
+   del encabezado real y las filas totalmente vacías (p. ej. totales al
+   final del archivo). */
+function rawRowsToObjects(rawRows){
+  const headerIdx = detectHeaderRowIndex(rawRows, KNOWN_HEADERS);
+  const headers = (rawRows[headerIdx] || []).map(h => String(h ?? "").trim());
+  const objects = [];
+  for(let i = headerIdx + 1; i < rawRows.length; i++){
+    const r = rawRows[i] || [];
+    const hasData = r.some(cell => String(cell ?? "").trim() !== "");
+    if(!hasData) continue;
+    const o = {};
+    headers.forEach((h, idx) => { if(h) o[h] = r[idx]; });
+    objects.push(o);
+  }
+  return objects;
 }
 
 function readFileAsData(file){
@@ -1873,10 +1963,7 @@ function readFileAsData(file){
       reader.onload = () => {
         const rows = parseCSV(reader.result);
         const sheetName = file.name.replace(/\.[^.]+$/, "") || "CSV";
-        if(!rows.length){ resolve({type:"sheets", sheets:{ [sheetName]: [] }}); return; }
-        const headers = rows[0];
-        const objects = rows.slice(1).map(r => { const o = {}; headers.forEach((h,i)=> o[h]=r[i]); return o; });
-        resolve({type:"sheets", sheets:{ [sheetName]: objects }});
+        resolve({type:"sheets", sheets:{ [sheetName]: rawRowsToObjects(rows) }});
       };
       reader.onerror = () => reject(new Error("No se pudo leer el archivo"));
       reader.readAsText(file);
@@ -1887,7 +1974,10 @@ function readFileAsData(file){
         try{
           const wb = XLSX.read(new Uint8Array(reader.result), {type:"array", cellDates:true});
           const sheets = {};
-          wb.SheetNames.forEach(name => { sheets[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], {defval:""}); });
+          wb.SheetNames.forEach(name => {
+            const raw = XLSX.utils.sheet_to_json(wb.Sheets[name], {header:1, defval:""});
+            sheets[name] = rawRowsToObjects(raw);
+          });
           resolve({type:"sheets", sheets});
         }catch(e){ reject(e); }
       };
@@ -1899,67 +1989,96 @@ function readFileAsData(file){
   });
 }
 
-function handleImportFile(file, targetModule){
-  readFileAsData(file).then(result => {
-    if(result.type === "json"){
-      const payload = result.payload;
-      if(payload && payload.data && payload.catalogos){
-        DB = payload.data; CAT = payload.catalogos;
-        persistDB(); persistCat();
-        toast("Respaldo completo importado correctamente");
-        finishImport();
-        return;
-      }
-      if(Array.isArray(payload)){
-        if(!targetModule){ toast("Selecciona un módulo destino para este archivo"); return; }
-        const { added, skipped } = importObjectsIntoModule(targetModule, payload);
-        persistDB();
-        toast(`${added} registro(s) importado(s)${skipped ? `, ${skipped} omitido(s) por datos incompletos` : ""}`);
-        finishImport();
-        return;
-      }
-      toast("El archivo JSON no tiene un formato reconocido");
-      return;
-    }
+/* Procesa UN archivo y devuelve un resumen {added, skipped, duplicated,
+   backup}. No muestra toast ni cierra el modal — eso lo hace quien la
+   llama, una sola vez, después de procesar todos los archivos elegidos
+   (ver runImport), para poder importar varios archivos en una sola
+   operación y acumular sus totales correctamente. */
+async function handleImportFile(file, targetModule){
+  const result = await readFileAsData(file);
 
-    // CSV / Excel / ODS → objetos agrupados por hoja
-    const sheetNames = Object.keys(result.sheets);
-    if(!targetModule){
-      let totalAdded = 0, totalSkipped = 0, matchedAny = false;
-      sheetNames.forEach(sn => {
-        const modKey = MODULE_ORDER.find(k => normalizeHeader(MODULES[k].label) === normalizeHeader(sn) || normalizeHeader(k) === normalizeHeader(sn));
-        if(modKey){
-          matchedAny = true;
-          const { added, skipped } = importObjectsIntoModule(modKey, result.sheets[sn]);
-          totalAdded += added; totalSkipped += skipped;
-        }
-      });
-      if(!matchedAny){ toast("No se reconoció ningún módulo en las hojas del archivo. Elige un módulo destino."); return; }
-      persistDB();
-      toast(`${totalAdded} registro(s) importado(s) en total${totalSkipped ? `, ${totalSkipped} omitido(s)` : ""}`);
-      finishImport();
-    } else {
-      const cfg = MODULES[targetModule];
-      if(cfg.sheetAsField){
-        // Cada hoja del archivo se importa como registros separados, usando el nombre
-        // de la hoja como valor del campo indicado (p. ej. "obra" en Fletes).
-        let totalAdded = 0, totalSkipped = 0;
-        sheetNames.forEach(sn => {
-          const { added, skipped } = importObjectsIntoModule(targetModule, result.sheets[sn], { [cfg.sheetAsField]: sn });
-          totalAdded += added; totalSkipped += skipped;
-        });
-        persistDB();
-        toast(`${totalAdded} registro(s) importado(s)${totalSkipped ? `, ${totalSkipped} omitido(s) por datos incompletos` : ""}`);
-        finishImport();
-      } else {
-        const data = result.sheets[sheetNames[0]] || [];
-        const { added, skipped } = importObjectsIntoModule(targetModule, data);
-        persistDB();
-        toast(`${added} registro(s) importado(s)${skipped ? `, ${skipped} omitido(s) por datos incompletos` : ""}`);
-        finishImport();
-      }
+  if(result.type === "json"){
+    const payload = result.payload;
+    if(payload && payload.data && payload.catalogos){
+      DB = payload.data; CAT = payload.catalogos;
+      await persistDB();
+      await persistCat();
+      return { added:0, skipped:0, duplicated:0, backup:true };
     }
-  }).catch(err => toast(err.message || "No se pudo leer el archivo"));
+    if(Array.isArray(payload)){
+      if(!targetModule) throw new Error(`Elige un módulo destino para "${file.name}"`);
+      const { added, skipped, duplicated } = importObjectsIntoModule(targetModule, payload);
+      await persistDB();
+      return { added, skipped, duplicated };
+    }
+    throw new Error(`"${file.name}" no tiene un formato JSON reconocido`);
+  }
+
+  // CSV / Excel / ODS → objetos agrupados por hoja
+  const sheetNames = Object.keys(result.sheets);
+  if(!targetModule){
+    let totalAdded = 0, totalSkipped = 0, totalDup = 0, matchedAny = false;
+    sheetNames.forEach(sn => {
+      const modKey = MODULE_ORDER.find(k => normalizeHeader(MODULES[k].label) === normalizeHeader(sn) || normalizeHeader(k) === normalizeHeader(sn));
+      if(modKey){
+        matchedAny = true;
+        const { added, skipped, duplicated } = importObjectsIntoModule(modKey, result.sheets[sn]);
+        totalAdded += added; totalSkipped += skipped; totalDup += duplicated;
+      }
+    });
+    if(!matchedAny) throw new Error(`No se reconoció ningún módulo en las hojas de "${file.name}". Elige un módulo destino.`);
+    await persistDB();
+    return { added: totalAdded, skipped: totalSkipped, duplicated: totalDup };
+  }
+
+  const cfg = MODULES[targetModule];
+  if(cfg.sheetAsField){
+    // Cada hoja del archivo se importa como registros separados, usando el nombre
+    // de la hoja como valor del campo indicado (p. ej. "obra" en Fletes), salvo
+    // que la fila ya traiga ese dato (p. ej. una columna "Obra" con datos reales).
+    let totalAdded = 0, totalSkipped = 0, totalDup = 0;
+    sheetNames.forEach(sn => {
+      const { added, skipped, duplicated } = importObjectsIntoModule(targetModule, result.sheets[sn], { [cfg.sheetAsField]: sn });
+      totalAdded += added; totalSkipped += skipped; totalDup += duplicated;
+    });
+    await persistDB();
+    return { added: totalAdded, skipped: totalSkipped, duplicated: totalDup };
+  }
+
+  const data = result.sheets[sheetNames[0]] || [];
+  const { added, skipped, duplicated } = importObjectsIntoModule(targetModule, data);
+  await persistDB();
+  return { added, skipped, duplicated };
+}
+
+/* Procesa todos los archivos elegidos, uno por uno y en orden (esperando
+   a que cada uno termine de guardarse antes de empezar el siguiente), y
+   muestra un único resumen al final. Procesarlos en orden —y no todos en
+   paralelo— es clave: evita que dos importaciones escriban en Supabase al
+   mismo tiempo y una se "coma" los datos de la otra. */
+async function runImport(files, targetModule){
+  let totals = { added:0, skipped:0, duplicated:0 };
+  let backupRestored = false;
+  const errors = [];
+  for(const file of files){
+    try{
+      const r = await handleImportFile(file, targetModule);
+      if(r.backup) backupRestored = true;
+      else { totals.added += r.added; totals.skipped += r.skipped; totals.duplicated += r.duplicated; }
+    }catch(err){
+      errors.push(err.message || `No se pudo importar "${file.name}"`);
+    }
+  }
+  if(backupRestored){
+    toast("Respaldo completo importado correctamente");
+  } else {
+    const parts = [`${totals.added} registro(s) importado(s)`];
+    if(totals.skipped) parts.push(`${totals.skipped} omitido(s) por datos incompletos`);
+    if(totals.duplicated) parts.push(`${totals.duplicated} omitido(s) por duplicado`);
+    toast(parts.join(", "));
+  }
+  errors.forEach(msg => toast(msg));
+  finishImport();
 }
 
 function finishImport(){
@@ -1984,12 +2103,14 @@ function openImportModal(moduleKey){
             </select>
           </div>` : `<p style="color:var(--ink-soft); font-size:13px;">Los registros del archivo se añadirán como nuevos registros de <b>${esc(MODULES[moduleKey].label)}</b>.${MODULES[moduleKey].sheetAsField ? " Si el Excel tiene varias hojas, cada hoja se importará como una <b>Obra</b> distinta (el nombre de la hoja se usa como Obra)." : ""}</p>`}
           <div class="form-field span2" style="margin-top:12px;">
-            <label>Archivo</label>
-            <input type="file" id="importFile" accept=".json,.csv,.xlsx,.xls,.xlsm,.ods">
+            <label>Archivo(s)</label>
+            <input type="file" id="importFile" accept=".json,.csv,.xlsx,.xls,.xlsm,.ods" multiple>
           </div>
           <p style="color:var(--ink-faint); font-size:11.5px; margin-top:10px;">
             Formatos aceptados: JSON, CSV, Excel (.xlsx, .xls, .xlsm) y OpenDocument (.ods).
             No se aceptan imágenes ni archivos de texto plano (.txt).
+            Puedes elegir varios archivos a la vez (se importan uno por uno y se acumulan).
+            Si una fila del archivo coincide con un flete que ya existe, se omite en vez de duplicarse.
           </p>
         </div>
         <div class="modal-foot">
@@ -2001,11 +2122,20 @@ function openImportModal(moduleKey){
   $("#modalClose").addEventListener("click", closeModal);
   $("#btnCancel").addEventListener("click", closeModal);
   $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
-  $("#btnDoImport").addEventListener("click", () => {
-    const file = $("#importFile").files[0];
-    if(!file){ toast("Selecciona un archivo primero"); return; }
+  $("#btnDoImport").addEventListener("click", async () => {
+    const files = [...$("#importFile").files];
+    if(!files.length){ toast("Selecciona al menos un archivo primero"); return; }
     const target = isAll ? ($("#importTarget").value || null) : moduleKey;
-    handleImportFile(file, target);
+    const btn = $("#btnDoImport");
+    btn.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = files.length > 1 ? `Importando ${files.length} archivos…` : "Importando…";
+    try{
+      await runImport(files, target);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
   });
 }
 
