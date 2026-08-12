@@ -139,6 +139,7 @@ async function syncModuleTable(moduleKey){
    cambio hecho desde el panel escribe solo la fila que cambió. */
 async function upsertRutaRow(row){
   const payload = sanitizeRowForDb("rutas", row);
+  payload.conductorAuthId = await fetchAuthIdDeConductor(row.conductor);
   const { error } = await supabaseClient.from("rutas").upsert(payload, { onConflict: "nro" });
   if(error){ console.error("Supabase upsert error rutas", error); toast("Error al guardar la ruta"); }
 }
@@ -307,6 +308,23 @@ const authIdDeConductor = nombreCompleto => {
   const c = DB.conductores.find(c => `${c.nombres || ""} ${c.apellidos || ""}`.trim() === full);
   return (c && c.authUserId) ? c.authUserId : null;
 };
+/* Igual que authIdDeConductor, pero consultando Supabase en vivo en vez del
+   DB.conductores cacheado en esta pestaña. Evita guardar conductorAuthId
+   desactualizado (null) cuando el conductor se registró en la app DESPUÉS
+   de que este panel cargó — sin esto, la ruta queda invisible para él por
+   RLS y nada la repara automáticamente después. Se usa justo antes de
+   escribir en "rutas" (insert y upsert), nunca para el resto de la UI. */
+async function fetchAuthIdDeConductor(nombreCompleto){
+  const full = String(nombreCompleto || "").trim();
+  if(!full) return null;
+  const { data, error } = await supabaseClient.from("conductores").select("nombres,apellidos,authUserId");
+  if(error){
+    console.error("Supabase select error conductores (authId)", error);
+    return authIdDeConductor(nombreCompleto); // fallback: mejor un dato cacheado que ninguno
+  }
+  const c = (data || []).find(c => `${c.nombres || ""} ${c.apellidos || ""}`.trim() === full);
+  return (c && c.authUserId) ? c.authUserId : null;
+}
 const nombresTalleres = () => DB.talleres.map(t => ({ value:t.nombre, label:t.nombre }));
 
 /* Obras por defecto: si el catálogo "obras" no existe todavía (o está
@@ -1179,6 +1197,7 @@ async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {})
     // creando otra ruta en este mismo instante desde su teléfono.
     const payload = sanitizeRowForDb("rutas", data);
     delete payload.nro;
+    payload.conductorAuthId = await fetchAuthIdDeConductor(data.conductor);
     const { data: inserted, error } = await supabaseClient.from("rutas").insert(payload).select().single();
     if(error){ console.error("Supabase insert error rutas", error); toast("Error al crear la ruta"); return; }
     data.nro = inserted.nro;

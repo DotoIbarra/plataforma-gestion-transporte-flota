@@ -25,6 +25,7 @@ let session = null;
 let profile = null;      // fila propia de "conductores"
 let flotaPlacas = [];    // [{value,label}]
 let estadosCat = ["Disponible","En viaje","En mantenimiento","No disponible"];
+let obrasCat = [];       // catálogo de obras (mismo que usa el panel admin)
 let rutas = [];
 let authBusy = false;
 let realtimeChannel = null;
@@ -246,6 +247,11 @@ async function loadProfileAndData(){
 
   flotaPlacas = (flota || []).map(v => ({ value: v.placa, label: `${v.placa} — ${v.marca} ${v.modelo}` }));
   if(cat && cat.value && Array.isArray(cat.value.estadosVehiculo)) estadosCat = cat.value.estadosVehiculo;
+  // Mismo catálogo de Obras que usa el panel admin (CAT.obras), para que la
+  // ruta creada por el conductor quede con la misma Obra disponible ahí —
+  // sin esto, "obra" quedaba vacío y el flete espejo en Fletes no se podía
+  // filtrar ni asociar a la obra correspondiente.
+  if(cat && cat.value && Array.isArray(cat.value.obras)) obrasCat = cat.value.obras.slice().sort((a,b)=>a.localeCompare(b,"es"));
   rutas = await purgeClosedRoutes(misRutas || []);
 
   renderApp();
@@ -368,6 +374,13 @@ function openRouteForm(existing){
             ${estadosCat.map(e => `<option value="${esc(e)}" ${draft.estado===e?"selected":""}>${esc(e)}</option>`).join("")}
           </select>
         </div>
+        <div class="field">
+          <label>Obra *</label>
+          <select id="fObra" required>
+            <option value="">— Seleccionar —</option>
+            ${obrasCat.map(o => `<option value="${esc(o)}" ${draft.obra===o?"selected":""}>${esc(o)}</option>`).join("")}
+          </select>
+        </div>
         <div class="field-row">
           <div class="field"><label>Origen</label><input type="text" id="fOrigen" maxlength="200" value="${esc(draft.origen||"")}"></div>
           <div class="field"><label>Destino</label><input type="text" id="fDestino" maxlength="200" value="${esc(draft.destino||"")}"></div>
@@ -450,7 +463,8 @@ async function submitRoute(existing, imageDraft, overlay){
   const nombreCompleto = `${profile?.nombres||""} ${profile?.apellidos||""}`.trim();
   const placa = $("#fPlaca", overlay).value;
   const fechaSalida = $("#fFechaSalida", overlay).value;
-  if(!placa || !fechaSalida){ toast("Falta completar Placa o Fecha salida"); return; }
+  const obra = $("#fObra", overlay).value;
+  if(!placa || !fechaSalida || !obra){ toast("Falta completar Placa, Fecha salida u Obra"); return; }
 
   const payload = {
     fechaSalida,
@@ -458,6 +472,7 @@ async function submitRoute(existing, imageDraft, overlay){
     placa,
     estado: $("#fEstado", overlay).value || "",
     conductor: nombreCompleto,
+    obra,
     origen: $("#fOrigen", overlay).value.trim(),
     destino: $("#fDestino", overlay).value.trim(),
     fotoInicio: imageDraft.fotoInicio || "",
