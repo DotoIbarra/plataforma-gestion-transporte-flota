@@ -1,34 +1,40 @@
 /* ==========================================================================
    MIS RUTAS — app del conductor
-   Usa el MISMO proyecto Supabase que el panel web (js/supabase-config.js),
-   pero autenticado (Supabase Auth). Cada conductor solo ve y administra
-   sus propias rutas — lo aplica Postgres con Row Level Security, esto en
-   el navegador es solo la interfaz.
+   Habla con la API propia (PHP + MySQL) en vez de Supabase. Cada conductor
+   solo ve y administra sus propias rutas — lo aplica el servidor
+   (api/conductor_rutas/*.php), esto en el navegador es solo la interfaz.
    ========================================================================== */
 
-// persistSession:false => la sesión NO se guarda en localStorage del teléfono.
-// Cada vez que se abre/recarga la app se exige login de nuevo, así nunca se
-// "arrastra" por error la cuenta de otro conductor que haya usado este mismo
-// teléfono antes (pruebas, préstamo del teléfono, etc). La identidad de cada
-// carga siempre sale de un login real contra el servidor, nunca de un token
-// viejo cacheado en el navegador.
-const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: {
-    persistSession: false,
-    autoRefreshToken: true,
-    detectSessionInUrl: false
-  }
-});
-const EMAIL_DOMAIN = "conductor.flota.app"; // dominio interno, el conductor nunca lo ve
+// La API vive en public_html/api/, un nivel arriba de public_html/conductor/.
+const API_BASE = "../api";
 
-let session = null;
+async function apiFetch(path, opts = {}){
+  let res;
+  try{
+    res = await fetch(`${API_BASE}/${path}`, {
+      method: opts.method || "GET",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include", // imprescindible: así viaja la cookie de sesión del conductor
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch(networkErr){
+    return { data: null, error: "No hay conexión a internet." };
+  }
+  let json = null;
+  try{ json = await res.json(); } catch(parseErr){}
+  if(!res.ok){
+    return { data: null, error: (json && json.error) || `Error ${res.status}` };
+  }
+  return { data: json, error: null };
+}
+
 let profile = null;      // fila propia de "conductores"
 let flotaPlacas = [];    // [{value,label}]
 let estadosCat = ["Disponible","En viaje","En mantenimiento","No disponible"];
 let obrasCat = [];       // catálogo de obras (mismo que usa el panel admin)
 let rutas = [];
 let authBusy = false;
-let realtimeChannel = null;
+let realtimeChannel = null; // ahora es un id de setInterval, no un canal de Supabase
 
 /* ---------------------------------------------------------------- utils */
 const $  = (sel, root=document) => root.querySelector(sel);
@@ -46,25 +52,17 @@ function toast(msg){
   toast._t = setTimeout(()=> t.classList.remove("show"), 2600);
 }
 
-/* Teléfono → solo dígitos, 8 a 15 (evita inyectar caracteres raros en el
-   correo interno que arma la cuenta). */
+/* Teléfono → solo dígitos, 8 a 15. */
 function normalizePhone(raw){ return String(raw||"").replace(/\D/g, ""); }
 function isValidPhone(digits){ return /^[0-9]{8,15}$/.test(digits); }
-function phoneToEmail(digits){ return `driver${digits}@${EMAIL_DOMAIN}`; }
 
 function isValidPassword(pw){
   return typeof pw === "string" && pw.length >= 8 && pw.length <= 72 && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw);
 }
 
-function mapAuthError(error){
-  const m = (error && error.message) || "";
-  if(/Invalid login credentials/i.test(m)) return "Teléfono o contraseña incorrectos.";
-  if(/already registered|already exists|User already registered/i.test(m)) return "Ese teléfono ya tiene una cuenta. Inicia sesión.";
-  if(/Password should be|password/i.test(m) && /least/i.test(m)) return "La contraseña no cumple los requisitos mínimos.";
-  if(/rate limit|too many/i.test(m)) return "Demasiados intentos. Espera un minuto y vuelve a intentar.";
-  if(/network/i.test(m)) return "No hay conexión a internet.";
-  return "No se pudo completar la operación. Intenta de nuevo.";
-}
+/* El backend ya devuelve mensajes de error en español, listos para mostrar
+   directo (ver api/conductor_auth/register.php y login.php) — ya no hace
+   falta traducir mensajes de Supabase Auth como antes. */
 
 function fileToCompressedDataURL(file, maxDim=1000, quality=0.72){
   return new Promise((resolve, reject) => {
@@ -158,15 +156,11 @@ async function doLogin(){
   if(!password){ showAuthError("Ingresa tu contraseña."); return; }
 
   setAuthBusy(true, "Entrando…");
-  // Por seguridad, siempre se cierra cualquier sesión que haya quedado
-  // guardada en este dispositivo antes de iniciar con las credenciales que
-  // se acaban de ingresar. Así el login SIEMPRE corresponde a la cuenta
-  // escrita en el formulario, nunca a una sesión anterior.
-  await supabaseClient.auth.signOut();
-  const { error } = await supabaseClient.auth.signInWithPassword({ email: phoneToEmail(digits), password });
+  const { data, error } = await apiFetch("conductor_auth/login.php", { method: "POST", body: { telefono: digits, password } });
   setAuthBusy(false, "Entrar");
-  if(error){ showAuthError(mapAuthError(error)); return; }
-  // onAuthStateChange se encarga de cargar la app
+  if(error){ showAuthError(error); return; }
+  profile = data.conductor;
+  await loadProfileAndData();
 }
 
 async function doSignup(){
@@ -184,22 +178,15 @@ async function doSignup(){
   if(password !== password2){ showAuthError("Las contraseñas no coinciden."); return; }
 
   setAuthBusy(true, "Creando cuenta…");
-  const { data, error } = await supabaseClient.auth.signUp({
-    email: phoneToEmail(digits),
-    password,
-    options: { data: { telefono: digits, nombres, apellidos } }
+  const { data, error } = await apiFetch("conductor_auth/register.php", {
+    method: "POST",
+    body: { nombres, apellidos, telefono: digits, password, password2 }
   });
-  if(error){ setAuthBusy(false, "Crear mi cuenta"); showAuthError(mapAuthError(error)); return; }
-
-  if(!data.session){
-    // Por si el proyecto tiene "confirmar correo" activado igual se intenta
-    // entrar directo, porque el correo interno no es real y no puede confirmarse.
-    const { error: loginErr } = await supabaseClient.auth.signInWithPassword({ email: phoneToEmail(digits), password });
-    setAuthBusy(false, "Crear mi cuenta");
-    if(loginErr){ showAuthError("Tu cuenta se creó, pero no se pudo iniciar sesión automáticamente. Contacta al administrador."); return; }
-    return;
-  }
   setAuthBusy(false, "Crear mi cuenta");
+  if(error){ showAuthError(error); return; }
+  // register.php ya deja la sesión iniciada (igual que hacía Supabase al registrarse).
+  profile = data.conductor;
+  await loadProfileAndData();
 }
 
 let authCooldown = null;
@@ -217,65 +204,55 @@ function setAuthBusy(busy, label){
 async function loadProfileAndData(){
   $("#app").innerHTML = `<div class="center-loading"><div class="spinner"></div><p>Cargando tus rutas…</p></div>`;
 
-  // La fila de "conductores" la crea/vincula un trigger en el servidor justo
-  // al registrarse; puede tardar una fracción de segundo en verse reflejada.
-  // Se llama primero a la auto-reparación server-side: vincula la fila de
-  // "conductores" si faltaba (cuenta creada antes del trigger, o a mano) y
-  // engancha cualquier ruta que el admin le haya creado por nombre y que
-  // todavía no tenga conductorAuthId. Es idempotente — no hace nada si ya
-  // estaba todo enlazado, así que es seguro llamarla en cada carga.
-  let prof = null;
-  const { data: repaired, error: repairErr } = await supabaseClient.rpc("link_my_conductor_profile");
-  if(!repairErr && repaired && repaired.nro) prof = repaired;
-
-  // Si aún así no aparece (posible carrera justo después del registro,
-  // mientras el trigger de creación todavía no terminaba), se reintenta
-  // la lectura directa unos segundos.
-  for(let i=0; i<5 && !prof; i++){
-    const { data } = await supabaseClient.from("conductores").select("*").eq("authUserId", session.user.id).maybeSingle();
-    if(data){ prof = data; break; }
-    await new Promise(r => setTimeout(r, 400));
-  }
-
-  profile = prof;
-
-  const [{ data: flota }, { data: cat }, { data: misRutas }] = await Promise.all([
-    supabaseClient.from("flota").select("placa,marca,modelo").order("placa"),
-    supabaseClient.from("app_storage").select("value").eq("key", "flota_catalogos_v1").maybeSingle(),
-    supabaseClient.from("rutas").select("*").order("fechaSalida", { ascending: false }),
+  // Ya no hace falta reparar/reintentar el enlace de la cuenta: el backend
+  // (api/conductor_auth/login.php y register.php) siempre deja la ficha de
+  // "conductores" enlazada de una, sin condiciones de carrera que reparar.
+  const [profileRes, refRes, rutasRes] = await Promise.all([
+    apiFetch("conductor_auth/me.php"),
+    apiFetch("conductor_data/reference.php"),
+    apiFetch("conductor_rutas/list.php"),
   ]);
 
-  flotaPlacas = (flota || []).map(v => ({ value: v.placa, label: `${v.placa} — ${v.marca} ${v.modelo}` }));
-  if(cat && cat.value && Array.isArray(cat.value.estadosVehiculo)) estadosCat = cat.value.estadosVehiculo;
-  // Mismo catálogo de Obras que usa el panel admin (CAT.obras), para que la
-  // ruta creada por el conductor quede con la misma Obra disponible ahí —
-  // sin esto, "obra" quedaba vacío y el flete espejo en Fletes no se podía
-  // filtrar ni asociar a la obra correspondiente.
-  if(cat && cat.value && Array.isArray(cat.value.obras)) obrasCat = cat.value.obras.slice().sort((a,b)=>a.localeCompare(b,"es"));
-  rutas = await purgeClosedRoutes(misRutas || []);
+  if(profileRes.error || !profileRes.data.logged_in){
+    profile = null; rutas = [];
+    renderAuth("login");
+    return;
+  }
+  profile = profileRes.data.conductor;
+
+  const ref = refRes.data || { flota: [], catalogos: {} };
+  flotaPlacas = (ref.flota || []).map(v => ({ value: v.placa, label: `${v.placa} — ${v.marca} ${v.modelo}` }));
+  if(Array.isArray(ref.catalogos?.estadosVehiculo)) estadosCat = ref.catalogos.estadosVehiculo;
+  // Mismo catálogo de Obras que usa el panel admin, para que la ruta creada
+  // por el conductor quede con la misma Obra disponible ahí — sin esto,
+  // "obra" quedaba vacío y el flete espejo en Fletes no se podía asociar.
+  if(Array.isArray(ref.catalogos?.obras)) obrasCat = ref.catalogos.obras.slice().sort((a,b)=>a.localeCompare(b,"es"));
+
+  rutas = purgeClosedRoutes((rutasRes.data && rutasRes.data.rows) || []);
 
   renderApp();
   watchRealtime();
 }
 
 function watchRealtime(){
-  if(realtimeChannel) supabaseClient.removeChannel(realtimeChannel);
-  realtimeChannel = supabaseClient
-    .channel("mis-rutas-" + (session?.user?.id || "anon"))
-    .on("postgres_changes",
-      { event: "*", schema: "public", table: "rutas", filter: `conductorAuthId=eq.${session.user.id}` },
-      async () => {
-        const { data } = await supabaseClient.from("rutas").select("*").order("fechaSalida", { ascending: false });
-        rutas = await purgeClosedRoutes(data || []);
-        if($("#routeList")) renderRouteList();
-      })
-    .subscribe();
+  // DIFERENCIA respecto a la versión con Supabase: Postgres avisaba al
+  // instante cuando algo cambiaba (Realtime). MySQL no tiene un equivalente
+  // disponible en hosting compartido, así que acá se sondea cada 30
+  // segundos en su lugar — sigue siendo automático, solo un poco menos
+  // inmediato.
+  if(realtimeChannel) clearInterval(realtimeChannel);
+  realtimeChannel = setInterval(async () => {
+    const { data, error } = await apiFetch("conductor_rutas/list.php");
+    if(error) return;
+    rutas = purgeClosedRoutes(data.rows || []);
+    if($("#routeList")) renderRouteList();
+  }, 30000);
 }
 
 // Una ruta cerrada (con report/fotoFin) ya no le sirve al conductor en su
 // lista: se oculta de su vista local. IMPORTANTE: "rutas" es una tabla
 // compartida con el panel de admin (y de ahí nace el registro "espejo" en
-// Fletes), así que esto NUNCA debe borrar la fila en Supabase — solo se
+// Fletes), así que esto NUNCA debe borrar la fila en el servidor — solo se
 // filtra del arreglo que ve el conductor en su propia pantalla.
 function purgeClosedRoutes(list){
   return list.filter(r => !isRouteClosed(r));
@@ -307,8 +284,10 @@ function renderApp(){
   `;
   renderRouteList();
   $("#btnLogout").addEventListener("click", async () => {
-    const { error } = await supabaseClient.auth.signOut();
-    if(error) toast("No se pudo cerrar sesión, revisa tu conexión e intenta de nuevo.");
+    await apiFetch("conductor_auth/logout.php", { method: "POST" });
+    if(realtimeChannel){ clearInterval(realtimeChannel); realtimeChannel = null; }
+    profile = null; rutas = [];
+    renderAuth("login");
   });
 }
 
@@ -467,11 +446,12 @@ async function submitRoute(existing, imageDraft, overlay){
   if(!placa || !fechaSalida || !obra){ toast("Falta completar Placa, Fecha salida u Obra"); return; }
 
   const payload = {
+    nro: existing ? existing.nro : undefined,
     fechaSalida,
     fechaLlegada: $("#fFechaLlegada", overlay).value || null,
     placa,
     estado: $("#fEstado", overlay).value || "",
-    conductor: nombreCompleto,
+    conductor: nombreCompleto, // el servidor lo vuelve a completar solo de todos modos, con el nombre real de la cuenta
     obra,
     origen: $("#fOrigen", overlay).value.trim(),
     destino: $("#fDestino", overlay).value.trim(),
@@ -485,21 +465,19 @@ async function submitRoute(existing, imageDraft, overlay){
   const btn = $("#routeSubmit", overlay);
   btn.disabled = true;
 
+  // api/conductor_rutas/save.php hace de una tanto la creación como la
+  // edición (según venga o no "nro" en el payload), y siempre revisa que la
+  // ruta editada sea realmente del conductor logueado antes de tocarla.
+  const { data, error } = await apiFetch("conductor_rutas/save.php", { method: "POST", body: payload });
+  btn.disabled = false;
+  if(error){ console.error(error); toast(existing ? "No se pudo guardar la ruta" : "No se pudo crear la ruta"); return; }
+
   if(existing){
-    const { error } = await supabaseClient.from("rutas").update(payload).eq("nro", existing.nro);
-    btn.disabled = false;
-    if(error){ console.error(error); toast("No se pudo guardar la ruta"); return; }
     const idx = rutas.findIndex(r => r.nro === existing.nro);
-    if(idx !== -1) rutas[idx] = { ...rutas[idx], ...payload };
+    if(idx !== -1) rutas[idx] = data.row;
     toast("Ruta actualizada");
   } else {
-    // Sin "nro": la base de datos lo asigna sola (secuencia compartida con
-    // el panel web), así nunca choca con una ruta creada por otro conductor
-    // o por el administrador al mismo tiempo.
-    const { data, error } = await supabaseClient.from("rutas").insert(payload).select().single();
-    btn.disabled = false;
-    if(error){ console.error(error); toast("No se pudo crear la ruta"); return; }
-    rutas.unshift(data);
+    rutas.unshift(data.row);
     toast("Ruta creada");
   }
   overlay.remove();
@@ -509,34 +487,12 @@ async function submitRoute(existing, imageDraft, overlay){
 /* ==========================================================================
    INIT
    ========================================================================== */
-supabaseClient.auth.onAuthStateChange((event, s) => {
-  session = s;
-  if(event === "SIGNED_IN" || (event === "INITIAL_SESSION" && s)){
-    loadProfileAndData();
-  } else if(event === "SIGNED_OUT"){
-    if(realtimeChannel){ supabaseClient.removeChannel(realtimeChannel); realtimeChannel = null; }
-    profile = null; rutas = [];
-    renderAuth("login");
-  }
-});
-
 document.addEventListener("DOMContentLoaded", async () => {
-  const { data } = await supabaseClient.auth.getSession();
-  session = data.session;
-  if(!session){ renderAuth("login"); return; }
-
-  // getSession() solo lee lo que quedó guardado en este dispositivo; antes
-  // de confiar en eso, se confirma contra el servidor de Supabase que ese
-  // usuario sigue siendo válido (getUser() sí consulta el servidor). Si no
-  // lo es (token viejo, cuenta borrada, etc.), se limpia todo y se vuelve a
-  // pedir login en vez de arrastrar datos de una sesión vieja.
-  const { data: userData, error: userErr } = await supabaseClient.auth.getUser();
-  if(userErr || !userData?.user){
-    await supabaseClient.auth.signOut();
-    session = null;
+  const { data, error } = await apiFetch("conductor_auth/me.php");
+  if(error || !data || !data.logged_in){
     renderAuth("login");
     return;
   }
-
+  profile = data.conductor;
   await loadProfileAndData();
 });

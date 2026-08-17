@@ -10,9 +10,32 @@ const LS_CAT   = "flota_catalogos_v1";
 const LS_TRASH = "flota_trash_v1";
 const LS_LOG   = "flota_log_v1";
 
-/* Cliente Supabase (creado en js/supabase-config.js a partir de SUPABASE_URL / SUPABASE_ANON_KEY) */
-const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const STORAGE_TABLE = "app_storage"; // catálogos, papelera y log (JSON)
+/* ==========================================================================
+   CLIENTE DE LA API PROPIA (PHP + MySQL) — reemplaza al cliente de Supabase.
+   Todas las funciones de este bloque devuelven {data, error}, igual que
+   hacía supabase-js, para no tener que reescribir el resto del archivo.
+   ========================================================================== */
+const API_BASE = "api"; // carpeta api/ dentro de public_html, junto a este index.html
+
+async function apiFetch(path, opts = {}){
+  let res;
+  try{
+    res = await fetch(`${API_BASE}/${path}`, {
+      method: opts.method || "GET",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include", // imprescindible: así viaja la cookie de sesión
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch(networkErr){
+    return { data: null, error: "No se pudo conectar con el servidor" };
+  }
+  let json = null;
+  try{ json = await res.json(); } catch(parseErr){ /* respuesta vacía o no-JSON */ }
+  if(!res.ok){
+    return { data: null, error: (json && json.error) || `Error ${res.status}` };
+  }
+  return { data: json, error: null };
+}
 
 let DB = null;
 let CAT = null;
@@ -81,11 +104,10 @@ function sanitizeRowForDb(moduleKey, row){
     out.rutaNro = (row.rutaNro !== undefined && row.rutaNro !== null && row.rutaNro !== "")
       ? Number(row.rutaNro) : null;
   }
-  if(moduleKey === "rutas"){
-    // Enlaza la ruta con la cuenta del conductor elegido en el selector,
-    // para que le aparezca en su app (RLS filtra "rutas" por este campo).
-    out.conductorAuthId = authIdDeConductor(row.conductor);
-  }
+  // OJO: ya no se calcula acá el enlace con la cuenta del conductor (antes
+  // "conductorAuthId"). El backend PHP (api/rutas/save.php) lo recalcula
+  // siempre él mismo a partir del texto del campo "conductor", así que
+  // cualquier valor que se mandara desde acá sería ignorado de todos modos.
   cfg.columns.forEach(c => {
     if(c.kind === "computed") return;
     const v = row[c.key];
@@ -100,40 +122,38 @@ function sanitizeRowForDb(moduleKey, row){
   return out;
 }
 
-/* Supabase/PostgREST limita cada select a un máximo de filas (1000 por
-   defecto). Sin esto, un módulo con más de 1000 registros (ej. un Excel
-   grande de fletes) perdería silenciosamente el resto al recargar. */
+/* api/{tabla}/list.php ya devuelve TODAS las filas en una sola respuesta
+   (no hay límite de 1000 como en PostgREST), así que esto es ahora un
+   simple llamado. Se mantiene el mismo nombre/forma de retorno para no
+   tener que tocar el resto del archivo. */
 async function fetchAllRows(table){
-  const pageSize = 1000;
-  let all = [];
-  let from = 0;
-  while(true){
-    const { data, error } = await supabaseClient
-      .from(table).select("*").order("nro", { ascending: true })
-      .range(from, from + pageSize - 1);
-    if(error) return { data: null, error };
-    all = all.concat(data || []);
-    if(!data || data.length < pageSize) break;
-    from += pageSize;
-  }
-  return { data: all, error: null };
+  const { data, error } = await apiFetch(`${table}/list.php`);
+  if(error) return { data: null, error };
+  return { data: data.rows || [], error: null };
 }
 
-/* Inserta/actualiza en bloques (para no exceder el tamaño máximo de una
-   sola petición) sin tocar el resto de la tabla. */
-async function upsertInChunks(table, rows, chunkSize = 500){
-  for(let i = 0; i < rows.length; i += chunkSize){
-    const chunk = rows.slice(i, i + chunkSize);
-    const { error } = await supabaseClient.from(table).upsert(chunk, { onConflict: "nro" });
-    if(error) return error;
+/* api/{tabla}/save.php solo acepta UNA fila por llamado (a diferencia del
+   upsert por lote de Supabase), así que acá se manda cada fila con un
+   límite de peticiones en paralelo (concurrencia), en vez de una sola
+   petición gigante. Igual de seguro, y evita mandar cientos de fetch()
+   verdaderamente al mismo tiempo. */
+async function upsertInChunks(table, rows, concurrency = 8){
+  const endpoint = `${table}/save.php`;
+  for(let i = 0; i < rows.length; i += concurrency){
+    const batch = rows.slice(i, i + concurrency);
+    const results = await Promise.all(batch.map(row => apiFetch(endpoint, { method: "POST", body: row })));
+    const failed = results.find(r => r.error);
+    if(failed) return failed.error;
   }
   return null;
 }
-async function deleteNrosInChunks(table, nros, chunkSize = 500){
-  for(let i = 0; i < nros.length; i += chunkSize){
-    const chunk = nros.slice(i, i + chunkSize);
-    const { error } = await supabaseClient.from(table).delete().in("nro", chunk);
-    if(error) return error;
+async function deleteNrosInChunks(table, nros, concurrency = 8){
+  const endpoint = `${table}/delete.php`;
+  for(let i = 0; i < nros.length; i += concurrency){
+    const batch = nros.slice(i, i + concurrency);
+    const results = await Promise.all(batch.map(nro => apiFetch(endpoint, { method: "POST", body: { nro } })));
+    const failed = results.find(r => r.error);
+    if(failed) return failed.error;
   }
   return null;
 }
@@ -220,7 +240,7 @@ async function restoreFullBackup(payload){
   DB = payload.data;
   CAT = payload.catalogos;
   await Promise.all(MODULE_ORDER.map(async key => {
-    const { data: existing, error } = await supabaseClient.from(key).select("nro");
+    const { data: existing, error } = await fetchAllRows(key);
     const existingNros = (!error && existing) ? existing.map(r => Number(r.nro)) : [];
     const newNros = new Set((DB[key] || []).map(r => Number(r.nro)));
     const toDelete = existingNros.filter(n => !newNros.has(n));
@@ -233,50 +253,67 @@ async function restoreFullBackup(payload){
 /* "rutas" es la única tabla que también escriben los conductores desde su
    propia app (con su sesión, en paralelo al panel web). Por eso siempre
    usó upsert por fila (nunca el patrón "borrar todo"), igual que ahora
-   hacen todos los demás módulos. */
+   hacen todos los demás módulos. El enlace con la cuenta del conductor
+   (antes "conductorAuthId") ya no se calcula acá: lo hace siempre el
+   backend (api/rutas/save.php) a partir del texto del campo "conductor". */
 async function upsertRutaRow(row){
   const payload = sanitizeRowForDb("rutas", row);
-  payload.conductorAuthId = await fetchAuthIdDeConductor(row.conductor);
-  const { error } = await supabaseClient.from("rutas").upsert(payload, { onConflict: "nro" });
-  if(error){ console.error("Supabase upsert error rutas", error); toast("Error al guardar la ruta"); }
+  const { error } = await apiFetch("rutas/save.php", { method: "POST", body: payload });
+  if(error){ console.error("Error al guardar ruta", error); toast("Error al guardar la ruta"); }
 }
 async function deleteRutaRow(nro){
-  const { error } = await supabaseClient.from("rutas").delete().eq("nro", Number(nro));
-  if(error){ console.error("Supabase delete error rutas", error); toast("Error al eliminar la ruta"); }
+  const { error } = await apiFetch("rutas/delete.php", { method: "POST", body: { nro: Number(nro) } });
+  if(error){ console.error("Error al eliminar ruta", error); toast("Error al eliminar la ruta"); }
 }
 
 async function saveKey(key, value){
-  const { error } = await supabaseClient
-    .from(STORAGE_TABLE)
-    .upsert({ key, value, updated_at: new Date().toISOString() });
-  if(error){ console.error("Supabase upsert error", key, error); toast("Error al guardar en la base de datos"); }
+  const { error } = await apiFetch("storage/save.php", { method: "POST", body: { key, value } });
+  if(error){ console.error("Error al guardar", key, error); toast("Error al guardar en la base de datos"); }
 }
 
 async function loadDB(){
   DB = {};
   await Promise.all(MODULE_ORDER.map(async key => {
     const { data, error } = await fetchAllRows(key);
-    if(error){ console.error("Supabase select error", key, error); toast("Error al cargar " + key); DB[key] = []; }
+    if(error){ console.error("Error al cargar", key, error); toast("Error al cargar " + key); DB[key] = []; }
     else { DB[key] = data || []; }
   }));
 
-  const { data, error } = await supabaseClient
-    .from(STORAGE_TABLE)
-    .select("key,value")
-    .in("key", [LS_CAT, LS_TRASH, LS_LOG]);
-  if(error){ console.error("Supabase select error", error); toast("Error al conectar con la base de datos"); }
-  const map = {};
-  (data || []).forEach(row => { map[row.key] = row.value; });
+  const { data, error } = await apiFetch("storage/get_all.php");
+  if(error){ console.error("Error al conectar con la base de datos", error); toast("Error al conectar con la base de datos"); }
+  const map = data ? { [LS_CAT]: data.catalogos, [LS_TRASH]: data.trash, [LS_LOG]: data.log } : {};
 
-  if(map[LS_CAT]){ CAT = map[LS_CAT]; }
-  else { CAT = JSON.parse(JSON.stringify(CATALOGOS)); await persistCat(); }
+  CAT = map[LS_CAT] || {};
 
-  // Catálogo de Obras: si no existe todavía (instalaciones ya creadas antes
-  // de este catálogo) o quedó vacío, se siembra con la lista por defecto.
-  if(!Array.isArray(CAT.obras) || !CAT.obras.length){
-    CAT.obras = [...new Set(OBRAS_POR_DEFECTO)];
-    await persistCat();
+  // Auto-reparación de catálogos: si a CAT le falta alguna clave que los
+  // formularios necesitan (por ejemplo porque la instalación es antigua y
+  // se agregó el catálogo después, o porque el registro guardado en el
+  // servidor quedó incompleto), se rellena con un valor por defecto en vez
+  // de dejar que los <select> revienten con "Cannot read properties of
+  // undefined". Cualquier clave que ya tenga datos válidos se respeta tal
+  // cual está.
+  let catRepaired = false;
+  const ensureCatList = (key, defaults) => {
+    if(!Array.isArray(CAT[key]) || !CAT[key].length){
+      CAT[key] = [...new Set(defaults)];
+      catRepaired = true;
+    }
+  };
+  ensureCatList("obras", OBRAS_POR_DEFECTO);
+  ensureCatList("tiposVehiculo", ["Camión","Camioneta","Furgón","Automóvil","Otro"]);
+  ensureCatList("estadosVehiculo", ["Disponible","En ruta","En taller","Fuera de servicio"]);
+  ensureCatList("infracciones", ["Exceso de velocidad","Estacionamiento","Documentación","Otra"]);
+  ensureCatList("tiposFlete", ["Nacional","Local","Interno"]);
+  if(!Array.isArray(CAT.marcaModelo)){ CAT.marcaModelo = []; catRepaired = true; }
+  if(!Array.isArray(CAT.tiposMantenimiento) || !CAT.tiposMantenimiento.length){
+    CAT.tiposMantenimiento = ["Preventivo","Correctivo"];
+    catRepaired = true;
   }
+  if(!CAT.paquetesMantenimiento || typeof CAT.paquetesMantenimiento !== "object"){
+    CAT.paquetesMantenimiento = {};
+    catRepaired = true;
+  }
+  if(catRepaired) await persistCat();
 
   if(map[LS_TRASH]){ TRASH = map[LS_TRASH]; MODULE_ORDER.forEach(k => { if(!TRASH[k]) TRASH[k] = []; }); }
   else { TRASH = emptyTrash(); await persistTrash(); }
@@ -320,10 +357,10 @@ function logActivity(moduleKey, action, nro, summary){
    guardar, pisar ese registro ajeno. Ahora se consulta primero el máximo
    real en la base de datos y se toma el mayor entre ese valor y el local. */
 async function nextNroSafe(moduleKey){
-  const { data, error } = await supabaseClient
-    .from(moduleKey).select("nro").order("nro", { ascending: false }).limit(1);
-  if(error) console.error("Supabase nro fetch error", moduleKey, error);
-  const serverMax = (!error && data && data.length) ? Number(data[0].nro) || 0 : 0;
+  const { data, error } = await fetchAllRows(moduleKey);
+  if(error) console.error("Error al calcular próximo nro", moduleKey, error);
+  const serverRows = (!error && data) ? data : [];
+  const serverMax = serverRows.length ? Math.max(...serverRows.map(r => Number(r.nro) || 0)) : 0;
   const rows = DB[moduleKey] || [];
   const localMax = rows.length ? Math.max(...rows.map(r => Number(r.nro) || 0)) : 0;
   return Math.max(serverMax, localMax) + 1;
@@ -370,6 +407,8 @@ function fleteDataFromRuta(ruta){
     solicitadoPor: ruta.solicitadoPor || "",
     fotoInicio: ruta.fotoInicio || "",
     fotoFin: ruta.fotoFin || "",
+    nroRepor: ruta.nroRepor || "",
+    nroGuia: ruta.nroGuia || "",
     valorFlete: calc.ingresoTotal || 0,
     rutaNro: ruta.nro,
   };
@@ -380,17 +419,15 @@ async function syncFleteFromRuta(ruta){
   const data = fleteDataFromRuta(ruta);
   if(idx !== -1){
     // Se sincronizan siempre los campos que vienen de la ruta (obra,
-    // descripción, fecha, lugar, solicitado por, fotos, valor). Los campos
-    // netamente administrativos que se completan a mano en Fletes (tipo,
-    // n° repor/guía/factura) no se tocan aquí para no perder lo que el
-    // usuario ya cargó.
+    // descripción, fecha, lugar, solicitado por, fotos, n° repor, n° guía,
+    // valor). Los campos netamente administrativos que se completan a mano
+    // en Fletes y no existen en Rutas (tipo, n° factura) no se tocan aquí
+    // para no perder lo que el usuario ya cargó.
     DB.fletes[idx] = { ...DB.fletes[idx], ...data };
     markDirty("fletes", DB.fletes[idx].nro);
   } else {
     data.nro = await nextNroSafe("fletes");
     data.tipoFlete = "";
-    data.nroRepor = "";
-    data.nroGuia = "";
     data.nroFactura = "";
     DB.fletes.push(data);
     markDirty("fletes", data.nro);
@@ -424,33 +461,11 @@ const nombresConductores = () => DB.conductores.map(c => {
   const label = c.authUserId ? full : `${full} (sin cuenta en la app)`;
   return { value: full, label };
 });
-/* Resuelve el authUserId (cuenta de Supabase Auth) del conductor elegido en
-   el selector de "rutas", a partir de su nombre completo. Si el conductor
-   todavía no se ha registrado en la app del conductor, devuelve null: la
-   ruta se guarda igual, y quedará visible para él automáticamente en cuanto
-   se registre (ver backfill en el trigger handle_new_driver). */
-const authIdDeConductor = nombreCompleto => {
-  const full = String(nombreCompleto || "").trim();
-  const c = DB.conductores.find(c => `${c.nombres || ""} ${c.apellidos || ""}`.trim() === full);
-  return (c && c.authUserId) ? c.authUserId : null;
-};
-/* Igual que authIdDeConductor, pero consultando Supabase en vivo en vez del
-   DB.conductores cacheado en esta pestaña. Evita guardar conductorAuthId
-   desactualizado (null) cuando el conductor se registró en la app DESPUÉS
-   de que este panel cargó — sin esto, la ruta queda invisible para él por
-   RLS y nada la repara automáticamente después. Se usa justo antes de
-   escribir en "rutas" (insert y upsert), nunca para el resto de la UI. */
-async function fetchAuthIdDeConductor(nombreCompleto){
-  const full = String(nombreCompleto || "").trim();
-  if(!full) return null;
-  const { data, error } = await supabaseClient.from("conductores").select("nombres,apellidos,authUserId");
-  if(error){
-    console.error("Supabase select error conductores (authId)", error);
-    return authIdDeConductor(nombreCompleto); // fallback: mejor un dato cacheado que ninguno
-  }
-  const c = (data || []).find(c => `${c.nombres || ""} ${c.apellidos || ""}`.trim() === full);
-  return (c && c.authUserId) ? c.authUserId : null;
-}
+/* authIdDeConductor / fetchAuthIdDeConductor ya no existen: el enlace entre
+   una ruta y la cuenta del conductor ahora lo calcula siempre el backend
+   (api/rutas/save.php), a partir del texto del campo "conductor", tanto al
+   crear como al editar. Así nunca puede quedar desactualizado ni depende
+   de qué tenga cargado esta pestaña en memoria. */
 const nombresTalleres = () => DB.talleres.map(t => ({ value:t.nombre, label:t.nombre }));
 
 /* Obras por defecto: si el catálogo "obras" no existe todavía (o está
@@ -560,6 +575,8 @@ const MODULES = {
       { key:"destino", label:"Destino", kind:"text" },
       { key:"fotoInicio", label:"Foto de inicio de ruta", kind:"image", wide:true },
       { key:"fotoFin", label:"Report", kind:"image", wide:true },
+      { key:"nroRepor", label:"N° Report", kind:"text" },
+      { key:"nroGuia", label:"N° GUIA", kind:"text" },
       { key:"pesoCarga", label:"Peso carga (Kg)", kind:"number", numeric:true },
       { key:"costoPorKg", label:"Costo x Kg ($)", kind:"number", numeric:true, money:true },
       { key:"ingresoTotal", label:"Ingreso total ($)", kind:"computed", numeric:true, money:true },
@@ -689,13 +706,52 @@ function renderSidebar(){
       <span class="ico">🗑️</span><span>Papelera</span><span class="count">${trashCount()}</span></button>`;
 
   $("#nav").innerHTML = html;
-  $$('#nav [data-nav]').forEach(b => b.addEventListener('click', ()=> goTo(b.dataset.nav)));
+  $$('#nav [data-nav]').forEach(b => b.addEventListener('click', ()=> { goTo(b.dataset.nav); closeMobileSidebar(); }));
 }
 
 function goTo(key){
   currentModule = key;
   renderSidebar();
   renderMain();
+}
+
+/* ==========================================================================
+   NAVEGACIÓN MÓVIL — barra superior con botón hamburguesa y sidebar
+   deslizable a modo cajón (off-canvas), para que el panel no se rompa en
+   pantallas de teléfono. Se inyecta una sola vez por sesión.
+   ========================================================================== */
+function ensureMobileTopbar(){
+  if($("#mobileTopbar")) return;
+
+  const topbar = document.createElement("div");
+  topbar.id = "mobileTopbar";
+  topbar.className = "mobile-topbar";
+  topbar.innerHTML = `
+    <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="Abrir menú">☰</button>
+    <div class="mobile-topbar-brand">
+      <div class="brand-mark"><span>OGV</span></div>
+      <b>Control Flota</b>
+    </div>`;
+
+  const backdrop = document.createElement("div");
+  backdrop.id = "sidebarBackdrop";
+  backdrop.className = "sidebar-backdrop";
+
+  const appRoot = $("#appRoot");
+  appRoot.prepend(topbar);
+  appRoot.appendChild(backdrop);
+
+  $("#mobileMenuBtn").addEventListener("click", () => toggleMobileSidebar());
+  backdrop.addEventListener("click", closeMobileSidebar);
+}
+
+function toggleMobileSidebar(){
+  $(".sidebar")?.classList.toggle("open");
+  $("#sidebarBackdrop")?.classList.toggle("show");
+}
+function closeMobileSidebar(){
+  $(".sidebar")?.classList.remove("open");
+  $("#sidebarBackdrop")?.classList.remove("show");
 }
 
 /* ==========================================================================
@@ -711,6 +767,40 @@ function renderMain(){
 }
 
 /* ---------------------------------------------------------------- DASHBOARD */
+function ultimosNMeses(n){
+  const out = [];
+  const now = new Date();
+  for(let i=n-1;i>=0;i--){
+    const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+    out.push({ key:`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`, label:MESES[d.getMonth()].slice(0,3) });
+  }
+  return out;
+}
+
+function barChartHTML(data, opts={}){
+  const max = Math.max(1, ...data.map(d=>d.value));
+  const fmt = opts.money ? (v)=>"$ "+fmtMoney(v) : (v)=>fmtNum(v);
+  return `<div class="bar-chart">
+    ${data.map(d=>`
+      <div class="bar-chart-col">
+        <span class="bar-chart-value">${d.value ? fmt(d.value) : ""}</span>
+        <div class="bar-chart-track"><div class="bar-chart-bar" style="height:${d.value ? Math.max(4,Math.round((d.value/max)*100)) : 0}%" title="${esc(d.label)}: ${fmt(d.value)}"></div></div>
+        <span class="bar-chart-label">${esc(d.label)}</span>
+      </div>`).join("")}
+  </div>`;
+}
+
+function hbarListHTML(rows, opts={}){
+  const max = Math.max(1, ...rows.map(r=>r.value));
+  if(!rows.length) return `<div class="empty-note">${esc(opts.emptyLabel || "Sin datos todavía.")}</div>`;
+  return rows.map(r => `
+    <div class="hbar-row">
+      <span class="hbar-label" title="${esc(r.label)}">${esc(r.label)}</span>
+      <div class="hbar-track"><div class="hbar-fill" style="width:${Math.max(4,Math.round((r.value/max)*100))}%; --c:${r.color || 'var(--accent)'}"></div></div>
+      <b class="hbar-value">${r.value}</b>
+    </div>`).join("");
+}
+
 function renderDashboard(){
   const totalVehiculos = DB.flota.length;
   const disponibles = DB.flota.filter(r=>r.estado==="Disponible").length;
@@ -725,6 +815,35 @@ function renderDashboard(){
   const rutasCalc = DB.rutas.map(r=>({...r, ...computeRuta(r)}));
   const ingresoTotal = rutasCalc.reduce((a,r)=>a+r.ingresoTotal,0);
 
+  const mantenimientosEnCurso = DB.mantenimiento.filter(m => m.fechaEntrada && !m.fechaSalida).length;
+
+  // ---- ingresos por mes (últimos 6 meses, según rutas) ----
+  const meses6 = ultimosNMeses(6);
+  const ingresosPorMesMap = {};
+  rutasCalc.forEach(r=>{
+    const fecha = r.fechaLlegada || r.fechaSalida;
+    if(!fecha) return;
+    const key = fecha.slice(0,7);
+    ingresosPorMesMap[key] = (ingresosPorMesMap[key]||0) + (r.ingresoTotal||0);
+  });
+  const ingresosChart = meses6.map(m => ({ label:m.label, value: Math.round(ingresosPorMesMap[m.key]||0) }));
+
+  // ---- estado de la flota ----
+  const estadoColors = { "Disponible":"var(--success)", "En ruta":"var(--accent)", "En taller":"var(--warning)", "Fuera de servicio":"var(--danger)" };
+  const estadoCounts = {};
+  DB.flota.forEach(v=>{ const e = v.estado || "Sin estado"; estadoCounts[e] = (estadoCounts[e]||0) + 1; });
+  const estadoRows = Object.entries(estadoCounts)
+    .sort((a,b)=>b[1]-a[1])
+    .map(([label,value])=>({ label, value, color: estadoColors[label] || "var(--route)" }));
+
+  // ---- top obras (por cantidad de fletes) ----
+  const obraCounts = {};
+  DB.fletes.forEach(f=>{ const o = (f.obra||"").trim(); if(!o) return; obraCounts[o] = (obraCounts[o]||0) + 1; });
+  const topObras = Object.entries(obraCounts).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([label,value])=>({label, value}));
+
+  // ---- actividad reciente ----
+  const actividadReciente = LOG.slice(0,6);
+
   $("#main").innerHTML = `
     <div class="topbar">
       <div><span class="eyebrow">Hoy · ${fmtDate(todayISO())}</span><h1>Panel general de flota</h1></div>
@@ -738,13 +857,19 @@ function renderDashboard(){
       <div class="kpi" style="--kpi-color:var(--accent)"><div class="label">Vehículos en flota</div><div class="value">${String(totalVehiculos).padStart(2,"0")}</div><div class="sub">${disponibles} disponibles</div></div>
       <div class="kpi ${porVencer.length?'warn':''}" style="--kpi-color:${porVencer.length?'var(--warning)':'var(--success)'}"><div class="label">Seguros por vencer/vencidos</div><div class="value">${String(porVencer.length).padStart(2,"0")}</div><div class="sub">próx. 30 días o vencidos</div></div>
       <div class="kpi ${multasPendientes.length?'danger':''}" style="--kpi-color:${multasPendientes.length?'var(--danger)':'var(--success)'}"><div class="label">Multas por pagar</div><div class="value">$ ${fmtMoney(totalDeuda)}</div><div class="sub">${multasPendientes.length} pendiente(s)</div></div>
+      <div class="kpi" style="--kpi-color:var(--route)"><div class="label">Fletes registrados</div><div class="value">${String(DB.fletes.length).padStart(2,"0")}</div><div class="sub">${DB.rutas.length} rutas de viaje</div></div>
+      <div class="kpi ${mantenimientosEnCurso?'warn':''}" style="--kpi-color:${mantenimientosEnCurso?'var(--warning)':'var(--success)'}"><div class="label">Mantenimientos en curso</div><div class="value">${String(mantenimientosEnCurso).padStart(2,"0")}</div><div class="sub">vehículos en taller</div></div>
     </div>
 
-    <div class="dash-grid">
+    <div class="dash-grid dash-grid-3">
       <div class="panel">
-        <h3><span class="ico">🗺️</span> Resultado de rutas registradas</h3>
-        <div class="mini-row"><span>Ingreso total por carga transportada</span><b class="stars" style="color:var(--success)">$ ${fmtMoney(ingresoTotal)}</b></div>
-        <div class="mini-row"><span>Viajes registrados</span><b>${DB.rutas.length}</b></div>
+        <h3><span class="ico">📈</span> Ingresos por mes (rutas)</h3>
+        ${barChartHTML(ingresosChart, { money:true })}
+      </div>
+
+      <div class="panel">
+        <h3><span class="ico">🚚</span> Estado de la flota</h3>
+        <div class="hbar-list">${hbarListHTML(estadoRows, { emptyLabel:"Sin vehículos registrados." })}</div>
       </div>
 
       <div class="panel">
@@ -754,6 +879,22 @@ function renderDashboard(){
         ${multasPendientes.map(r=>`
           <div class="mini-row"><span>${plateChip(r.placa)} multa ${esc(r.infraccion)}</span><span class="tag tag-danger">Debe $ ${fmtMoney(r.debe)}</span></div>`).join("") }
         ${(!porVencer.length && !multasPendientes.length) ? `<div class="empty-note">Todo en orden. Sin pendientes por ahora.</div>` : ""}
+      </div>
+    </div>
+
+    <div class="dash-grid">
+      <div class="panel">
+        <h3><span class="ico">🏗️</span> Top obras (por fletes)</h3>
+        <div class="hbar-list">${hbarListHTML(topObras, { emptyLabel:"Sin fletes registrados todavía." })}</div>
+      </div>
+
+      <div class="panel">
+        <h3><span class="ico">🕘</span> Actividad reciente</h3>
+        ${actividadReciente.length ? actividadReciente.map(e => `
+          <div class="mini-row">
+            <span>${esc(MODULES[e.moduleKey] ? MODULES[e.moduleKey].label : e.moduleKey)} — ${esc(e.summary || "#"+e.nro)}</span>
+            <span class="tag ${e.action==='delete'?'tag-danger':e.action==='create'?'tag-ok':'tag-warn'}">${esc(ACTION_LABELS[e.action] || e.action)}</span>
+          </div>`).join("") : `<div class="empty-note">Sin actividad registrada todavía.</div>`}
       </div>
     </div>
   `;
@@ -1324,15 +1465,14 @@ async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {})
     markDirty(moduleKey, savedRow.nro);
     toast("Registro actualizado");
   } else if(moduleKey === "rutas"){
-    // El nro lo entrega la base de datos (secuencia rutas_nro_seq), nunca
-    // max(nro)+1 calculado en el navegador: un conductor podría estar
-    // creando otra ruta en este mismo instante desde su teléfono.
+    // El nro lo asigna siempre el backend (MAX(nro)+1 calculado en el
+    // servidor, ver api/rutas/save.php), nunca el navegador: un conductor
+    // podría estar creando otra ruta en este mismo instante desde su teléfono.
     const payload = sanitizeRowForDb("rutas", data);
     delete payload.nro;
-    payload.conductorAuthId = await fetchAuthIdDeConductor(data.conductor);
-    const { data: inserted, error } = await supabaseClient.from("rutas").insert(payload).select().single();
-    if(error){ console.error("Supabase insert error rutas", error); toast("Error al crear la ruta"); return; }
-    data.nro = inserted.nro;
+    const { data: result, error } = await apiFetch("rutas/save.php", { method: "POST", body: payload });
+    if(error){ console.error("Error al crear ruta", error); toast("Error al crear la ruta"); return; }
+    data.nro = result.row.nro;
     DB.rutas.push(data);
     savedRow = data;
     toast("Registro creado");
@@ -2276,11 +2416,8 @@ function openImportModal(moduleKey){
 
 async function resetAll(){
   if(!confirm("Esto borrará TODOS los datos guardados en la base de datos (registros, catálogos personalizados, papelera e historial). Esta acción no se puede deshacer. ¿Continuar?")) return;
-  const results = await Promise.all(MODULE_ORDER.map(key => supabaseClient.from(key).delete().gte("nro", 0)));
-  const failedTable = results.find(r => r.error);
-  if(failedTable){ console.error("Supabase delete error", failedTable.error); toast("Error al borrar los datos"); return; }
-  const { error } = await supabaseClient.from(STORAGE_TABLE).delete().in("key", [LS_CAT, LS_TRASH, LS_LOG]);
-  if(error){ console.error("Supabase delete error", error); toast("Error al borrar los datos"); return; }
+  const { error } = await apiFetch("storage/reset_all.php", { method: "POST" });
+  if(error){ console.error("Error al borrar los datos", error); toast("Error al borrar los datos"); return; }
   _dirty = emptyDirty();
   await loadDB();
   goTo("dashboard");
@@ -2288,18 +2425,41 @@ async function resetAll(){
 }
 
 /* ==========================================================================
-   INIT
+   LOGIN DE ADMINISTRADOR
    ========================================================================== */
-document.addEventListener("DOMContentLoaded", async () => {
-  // El panel de admin nunca inicia sesión: siempre debe operar con el rol
-  // "anon" (que es el que tiene permisos de escritura en app_storage y en
-  // el resto de las tablas). Si en este mismo navegador se probó alguna vez
-  // el login de conductor, puede haber quedado una sesión de Supabase Auth
-  // activa que rompe los guardados por RLS (rol "authenticated" en vez de
-  // "anon"). Este signOut defensivo evita ese problema sin afectar en nada
-  // el funcionamiento normal del panel.
-  const { data: { session } } = await supabaseClient.auth.getSession();
-  if(session) await supabaseClient.auth.signOut();
+// El panel debe iniciar sesión para poder leer y escribir: cada endpoint de
+// api/ llama a require_admin(), que exige una cookie de sesión válida
+// vinculada a una fila real de la tabla admin_users (ver api/auth.php).
+let _appStarted = false;
+
+function showLoginScreen(errorMsg){
+  $("#appRoot").hidden = true;
+  $("#loginScreen").hidden = false;
+  const errBox = $("#loginError");
+  if(errorMsg){
+    errBox.textContent = errorMsg;
+    errBox.hidden = false;
+  } else {
+    errBox.hidden = true;
+    errBox.textContent = "";
+  }
+  $("#loginPassword").value = "";
+  setTimeout(() => $("#loginEmail").focus(), 30);
+}
+
+function hideLoginScreen(){
+  $("#loginScreen").hidden = true;
+  $("#appRoot").hidden = false;
+}
+
+async function startApp(admin){
+  if(_appStarted) return; // evita doble init si se llama más de una vez
+  _appStarted = true;
+  hideLoginScreen();
+
+  const email = admin?.email || "";
+  const sessionLabel = $("#adminSession");
+  if(sessionLabel) sessionLabel.textContent = email ? `Sesión: ${email}` : "";
 
   await loadDB();
   // Antes esta sincronización solo corría dentro del listener realtime de
@@ -2310,69 +2470,82 @@ document.addEventListener("DOMContentLoaded", async () => {
   // otro evento en vivo. Se corre también aquí, al cargar, para que el
   // primer render ya refleje el estado real de Fletes.
   await syncClosedRoutesToFletes();
+  ensureMobileTopbar();
   renderSidebar();
   renderMain();
   $("#btnReset").addEventListener("click", resetAll);
+  $("#btnLogout").addEventListener("click", async () => {
+    await apiFetch("logout.php", { method: "POST" });
+    _appStarted = false;
+    showLoginScreen();
+  });
   watchRutasRealtime();
+}
+
+function initLoginForm(){
+  const form = $("#loginForm");
+  const submitBtn = $("#loginSubmit");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = $("#loginEmail").value.trim();
+    const password = $("#loginPassword").value;
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Ingresando…";
+    const { data, error } = await apiFetch("login.php", { method: "POST", body: { email, password } });
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Ingresar";
+    if(error){
+      showLoginScreen("Email o contraseña incorrectos.");
+      return;
+    }
+    await startApp(data.admin);
+  });
+}
+
+/* ==========================================================================
+   INIT
+   ========================================================================== */
+document.addEventListener("DOMContentLoaded", async () => {
+  initLoginForm();
+
+  const { data, error } = await apiFetch("me.php");
+  if(!error && data && data.logged_in){
+    await startApp(data.admin);
+  } else {
+    showLoginScreen();
+  }
 });
 
 /* Espejo en vivo: cuando un conductor crea, edita o borra una ruta desde
-   su propia app (o desde otro navegador de este mismo panel), esta pestaña
-   recarga solo la tabla "rutas" desde Supabase y refresca la pantalla si
-   corresponde — sin que nadie tenga que apretar F5. */
+   su propia app, esta pestaña recarga la tabla "rutas" y refresca la
+   pantalla si corresponde — sin que nadie tenga que apretar F5.
+   -----------------------------------------------------------------------
+   DIFERENCIA IMPORTANTE respecto a la versión con Supabase: Postgres podía
+   avisar en el instante exacto en que algo cambiaba (Realtime). MySQL no
+   tiene un equivalente a eso disponible en hosting compartido, así que acá
+   se reemplaza por un sondeo periódico: cada POLL_MS se pregunta si algo
+   cambió. La demora máxima para ver un cambio de un conductor pasa de
+   "casi instantáneo" a "hasta POLL_MS" (30 segundos) — sigue siendo
+   automático, solo un poco menos inmediato. */
 function watchRutasRealtime(){
-  // Postgres manda un evento realtime POR CADA FILA que cambia. Sin debounce,
-  // una ráfaga de N cambios (varias fotos subidas seguidas, una importación,
-  // varias pestañas escribiendo casi a la vez) disparaba N recargas
-  // completas de la tabla "rutas" EN PARALELO, todas compitiendo por los
-  // mismos recursos de Postgres — eso era lo que terminaba superando el
-  // statement_timeout (error 57014) y llenando la consola de reintentos.
-  // Ahora se agrupan todos los eventos que lleguen dentro de una ventana
-  // corta en UNA sola recarga, que se dispara recién cuando la ráfaga
-  // termina (o como máximo cada MAX_WAIT_MS si los eventos no paran).
-  const DEBOUNCE_MS = 800;
-  const MAX_WAIT_MS = 4000;
-  let debounceTimer = null;
-  let maxWaitTimer = null;
+  const POLL_MS = 30000;
   let reloading = false;
-  let reloadAgainAfter = false;
 
   async function doReload(){
-    if(reloading){ reloadAgainAfter = true; return; } // ya hay una recarga en curso: pedir otra al terminar
+    if(reloading) return; // ya hay una recarga en curso, se espera al próximo intervalo
     reloading = true;
     try{
       const { data, error } = await fetchAllRows("rutas");
-      if(error){ console.error("Supabase realtime reload error", error); return; }
+      if(error){ console.error("Error al refrescar rutas", error); return; }
       DB.rutas = data || [];
       await syncClosedRoutesToFletes();
       if(["rutas", "dashboard", "fletes"].includes(currentModule)) renderMain();
     } finally {
       reloading = false;
-      if(reloadAgainAfter){ reloadAgainAfter = false; scheduleReload(); }
     }
   }
 
-  function scheduleReload(){
-    if(debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      clearTimeout(maxWaitTimer);
-      maxWaitTimer = null;
-      doReload();
-    }, DEBOUNCE_MS);
-    if(!maxWaitTimer){
-      maxWaitTimer = setTimeout(() => {
-        clearTimeout(debounceTimer);
-        debounceTimer = null;
-        maxWaitTimer = null;
-        doReload();
-      }, MAX_WAIT_MS);
-    }
-  }
-
-  supabaseClient
-    .channel("rutas-espejo")
-    .on("postgres_changes", { event: "*", schema: "public", table: "rutas" }, scheduleReload)
-    .subscribe();
+  setInterval(doReload, POLL_MS);
 }
 
 /* Cuando un conductor sube el Report (fotoFin) desde su propia app, la ruta
