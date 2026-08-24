@@ -131,6 +131,8 @@ button, input, select, textarea{ font-family:inherit; font-size:inherit; }
   border-radius:8px; padding:8px 10px; font-size:12px; cursor:pointer;
 }
 
+.tabbar{ padding:14px 16px 0; background:var(--bg); }
+.tabbar .auth-tabs{ margin-bottom:0; }
 .list-wrap{ flex:1; padding:16px 16px calc(90px + var(--safe-bottom)); }
 .list-empty{ text-align:center; color:var(--ink-faint); padding:60px 20px; }
 .list-empty .ico{ font-size:38px; display:block; margin-bottom:10px; }
@@ -149,6 +151,7 @@ button, input, select, textarea{ font-family:inherit; font-size:inherit; }
 .badge-neutral{ background:var(--surface-2); color:var(--ink-soft); }
 .badge-accent{ background:var(--warning-bg); color:var(--warning); }
 .badge-ok{ background:var(--success-bg); color:var(--success); }
+.badge-danger{ background:var(--danger-bg); color:var(--danger); }
 .route-card .rc-meta{ display:flex; flex-wrap:wrap; gap:6px 14px; font-size:12.5px; color:var(--ink-soft); margin-bottom:10px; }
 .route-card .rc-meta b{ color:var(--ink); font-weight:600; }
 .route-card .rc-actions{ display:flex; gap:8px; }

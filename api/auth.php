@@ -36,3 +36,22 @@ function require_admin(): void {
         json_error('No autenticado', 401);
     }
 }
+
+/** Rol del admin actualmente logueado ('admin' | 'operador'), o null si no hay sesión. */
+function current_admin_rol(): ?string {
+    start_secure_session();
+    return $_SESSION['admin_rol'] ?? null;
+}
+
+/**
+ * Corta la ejecución con 403 si el admin logueado no tiene rol "admin".
+ * Se usa en endpoints reservados solo para administradores (gestión de
+ * usuarios, restaurar respaldo completo), no para operadores/despachadores.
+ * Siempre llamar DESPUÉS de require_admin() (exige sesión antes que rol).
+ */
+function require_role_admin(): void {
+    require_admin();
+    if (current_admin_rol() !== 'admin') {
+        json_error('No tienes permisos de administrador para esta acción', 403);
+    }
+}

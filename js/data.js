@@ -15,6 +15,7 @@ const SEED = {
   multas: [],
   mantenimiento: [],
   fletes: [],
+  incidencias: [],
 };
 
 /* Catálogos ("Otras listas" en el Excel original) usados en los desplegables. */
@@ -57,4 +58,9 @@ const CATALOGOS = {
   estadosVehiculo: ["Disponible", "En viaje", "En mantenimiento", "No disponible"],
 
   tiposFlete: ["Camion Grande", "Camion Chico", "Camioneta", "Furgon", "Grua", "Otro"],
+
+  estadosServicio: ["Asignado", "Aceptado", "En ruta", "En destino", "Finalizado", "Cancelado"],
+  tiposIncidencia: ["Accidente de tránsito", "Falla mecánica", "Retraso de entrega", "Daño de carga", "Problema con cliente", "Robo o pérdida", "Conducta del conductor", "Otro"],
+  gravedadIncidencia: ["Baja", "Media", "Alta", "Crítica"],
+  estadosIncidencia: ["Abierta", "En revisión", "Resuelta", "Cerrada"],
 };

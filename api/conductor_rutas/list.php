@@ -3,7 +3,7 @@ require_once __DIR__ . '/../conductor_auth.php';
 require_conductor();
 
 const COLUMNS = [
-    'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'conductor',
+    'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'estadoServicio', 'conductor',
     'origen', 'destino', 'fotoInicio', 'fotoFin', 'pesoCarga', 'costoPorKg',
     'observaciones', 'obra', 'solicitadoPor', 'nroRepor', 'nroGuia',
 ];

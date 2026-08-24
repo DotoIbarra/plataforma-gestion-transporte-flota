@@ -237,6 +237,33 @@ a{ color:inherit; }
   font-family:var(--font-mono); margin-top:2px;
 }
 
+.notif-bell-wrap{ margin-left:auto; position:relative; flex-shrink:0; }
+.notif-bell{
+  background:none; border:none; cursor:pointer; font-size:17px; line-height:1;
+  padding:6px; border-radius:8px; position:relative; color:var(--navy-ink);
+}
+.notif-bell:hover{ background:rgba(255,255,255,.08); color:#fff; }
+.notif-badge{
+  position:absolute; top:1px; right:1px; min-width:15px; height:15px; padding:0 3px;
+  background:var(--danger); color:#fff; font-size:9.5px; font-weight:700;
+  border-radius:20px; display:flex; align-items:center; justify-content:center;
+  font-family:var(--font-mono); border:1.5px solid var(--navy);
+}
+.notif-panel{
+  position:absolute; top:calc(100% + 8px); right:-8px; width:320px; max-height:380px;
+  overflow-y:auto; background:var(--surface); color:var(--ink); border-radius:var(--radius-sm);
+  box-shadow:var(--shadow-lg); border:1px solid var(--border); z-index:90; padding:8px;
+}
+.notif-panel-empty{ padding:24px 12px; text-align:center; color:var(--ink-faint); font-size:12.5px; }
+.notif-item{
+  display:flex; flex-direction:column; gap:2px; padding:9px 10px; border-radius:8px;
+  font-size:12.5px; line-height:1.4;
+}
+.notif-item:not(:last-child){ border-bottom:1px solid var(--surface-2); }
+.notif-item.unread{ background:var(--accent-soft); }
+.notif-item .notif-msg{ color:var(--ink); }
+.notif-item .notif-time{ color:var(--ink-faint); font-size:10.5px; font-family:var(--font-mono); }
+
 .nav{ flex:1; overflow-y:auto; padding:14px 10px; }
 .nav-group-label{
   font-size:10.5px; text-transform:uppercase; letter-spacing:1.3px;
@@ -409,6 +436,15 @@ td.actions{ text-align:right; white-space:nowrap; }
 .badge-warn{ background:var(--warning-bg); color:var(--warning); }
 .badge-danger{ background:var(--danger-bg); color:var(--danger); }
 .badge-neutral{ background:var(--surface-2); color:var(--ink-soft); border:1px solid var(--border); }
+.badge-accent{ background:var(--accent-soft); color:var(--accent-dark); }
+
+/* Mapa operacional (#11) e Historial de operaciones (#17) */
+.leaflet-popup-content{ font-size:13px; line-height:1.5; }
+#mapaOperacional{ background:var(--surface-2); }
+.toolbar input[type="date"]{
+  background:var(--surface); border:1px solid var(--border); border-radius:8px;
+  padding:6px 8px; font:inherit; color:var(--ink);
+}
 .stars{ color:var(--accent); letter-spacing:1px; }
 
 /* ---------- catálogos ---------- */
@@ -492,6 +528,16 @@ td.actions{ text-align:right; white-space:nowrap; }
 .lightbox-overlay{ background:rgba(8,10,12,.88); align-items:center; }
 .lightbox-img{ max-width:min(92vw,900px); max-height:88vh; border-radius:10px; box-shadow:var(--shadow-lg); }
 .lightbox-close{ position:fixed; top:22px; right:28px; color:#fff; font-size:26px; }
+
+/* ---------- documentos adjuntos (p. ej. licencia de conducir en PDF) ---------- */
+.file-field{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; background:var(--surface-2); border:1px dashed var(--border-strong); border-radius:10px; padding:12px; }
+.file-actions{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.file-actions label.btn{ margin:0; }
+
+.pdf-viewer-frame{
+  width:min(92vw,900px); height:88vh; border:none; border-radius:10px;
+  background:#fff; box-shadow:var(--shadow-lg);
+}
 
 /* ---------- indicador de guardado automático ---------- */
 .save-indicator{

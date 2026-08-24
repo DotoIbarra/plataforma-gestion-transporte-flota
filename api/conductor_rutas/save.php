@@ -1,11 +1,12 @@
 <?php
 require_once __DIR__ . '/../conductor_auth.php';
 require_once __DIR__ . '/../crud_helpers.php';
+require_once __DIR__ . '/../notify.php';
 require_conductor();
 
 const TABLE = 'rutas';
 const COLUMNS = [
-    'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'conductor',
+    'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'estadoServicio', 'conductor',
     'origen', 'destino', 'fotoInicio', 'fotoFin', 'pesoCarga', 'costoPorKg',
     'observaciones', 'obra', 'solicitadoPor', 'nroRepor', 'nroGuia',
     'conductor_user_id',
@@ -53,5 +54,21 @@ $stmt->close();
 $input['conductor'] = trim(($perfil['nombres'] ?? '') . ' ' . ($perfil['apellidos'] ?? ''));
 $input['conductor_user_id'] = $myId;
 
+// Igual criterio que en api/rutas/save.php: una ruta nueva nace "Asignado"
+// (o "Finalizado" si ya viene con foto de cierre), y cualquier guardado que
+// agregue la foto de cierre finaliza el servicio automáticamente.
+if (($nro === null || $nro === '') && empty($input['estadoServicio'])) {
+    $input['estadoServicio'] = !empty($input['fotoFin']) ? 'Finalizado' : 'Asignado';
+}
+if (!empty($input['fotoFin']) && !in_array($input['estadoServicio'] ?? '', ['Finalizado', 'Cancelado'], true)) {
+    $input['estadoServicio'] = 'Finalizado';
+    $seFinalizoAhora = true;
+}
+
 $row = upsert_row(TABLE, COLUMNS, NUMERIC_COLS, DATE_COLS, $input);
+
+if (!empty($seFinalizoAhora)) {
+    notify('ruta_finalizada', "{$input['conductor']} finalizó la ruta #{$row['nro']} con Report", 'ruta', (int)$row['nro']);
+}
+
 json_response(['ok' => true, 'row' => $row]);

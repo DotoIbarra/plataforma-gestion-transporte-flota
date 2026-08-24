@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . '/../auth.php';
-require_admin();
+require_role_admin();
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     json_error('Método no permitido', 405);

@@ -11,5 +11,6 @@ json_response([
     'admin' => [
         'id' => $_SESSION['admin_id'],
         'email' => $_SESSION['admin_email'],
+        'rol' => $_SESSION['admin_rol'] ?? 'admin',
     ],
 ]);

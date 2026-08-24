@@ -32,7 +32,10 @@ async function apiFetch(path, opts = {}){
   let json = null;
   try{ json = await res.json(); } catch(parseErr){ /* respuesta vacía o no-JSON */ }
   if(!res.ok){
-    return { data: null, error: (json && json.error) || `Error ${res.status}` };
+    // Se conserva el JSON de error (no solo el mensaje) para casos como el
+    // conflicto de disponibilidad de rutas, donde el backend manda además
+    // el detalle de qué otro servicio choca en fechas.
+    return { data: json, error: (json && json.error) || `Error ${res.status}` };
   }
   return { data: json, error: null };
 }
@@ -43,6 +46,9 @@ let TRASH = null;
 let LOG = null;
 let currentModule = "dashboard";
 let editing = { module: null, nro: null };
+let currentAdmin = null;     // {id,email,nombre,rol} — rol: "admin" | "operador"
+let notifState = { rows: [], noLeidas: 0 };
+const isFullAdmin = () => currentAdmin?.rol === "admin";
 
 /* ---------------------------------------------------------------- utils */
 const $  = (sel, root=document) => root.querySelector(sel);
@@ -256,10 +262,30 @@ async function restoreFullBackup(payload){
    hacen todos los demás módulos. El enlace con la cuenta del conductor
    (antes "conductorAuthId") ya no se calcula acá: lo hace siempre el
    backend (api/rutas/save.php) a partir del texto del campo "conductor". */
+/**
+ * Entregable #6 (disponibilidad): guarda una ruta pasando siempre por
+ * rutas/save.php. Si el backend detecta que la placa o el conductor ya
+ * tienen otro servicio activo con fechas cruzadas, devuelve 409 con el
+ * detalle — acá se le muestra al admin y, si confirma, se reintenta una
+ * sola vez con forzarConflicto:true para dejarlo guardar igual.
+ */
+async function guardarRutaEnServidor(payload){
+  let { data, error } = await apiFetch("rutas/save.php", { method: "POST", body: payload });
+  if(error === "conflicto_disponibilidad"){
+    const detalle = (data.conflictos || []).map(c =>
+      `• ${c.recurso === "placa" ? "Vehículo" : "Conductor"} "${c[c.recurso]}" ya está asignado a la ruta #${c.nro} (${c.fechaSalida || "—"} → ${c.fechaLlegada || "sin cierre"}, estado ${c.estadoServicio})`
+    ).join("\n");
+    const forzar = confirm(`Este vehículo o conductor ya tiene otro servicio activo en fechas que se cruzan:\n\n${detalle}\n\n¿Guardar de todas formas?`);
+    if(!forzar) return { data: null, error: "cancelado" };
+    ({ data, error } = await apiFetch("rutas/save.php", { method: "POST", body: { ...payload, forzarConflicto: true } }));
+  }
+  return { data, error };
+}
+
 async function upsertRutaRow(row){
   const payload = sanitizeRowForDb("rutas", row);
-  const { error } = await apiFetch("rutas/save.php", { method: "POST", body: payload });
-  if(error){ console.error("Error al guardar ruta", error); toast("Error al guardar la ruta"); }
+  const { error } = await guardarRutaEnServidor(payload);
+  if(error && error !== "cancelado"){ console.error("Error al guardar ruta", error); toast("Error al guardar la ruta"); }
 }
 async function deleteRutaRow(nro){
   const { error } = await apiFetch("rutas/delete.php", { method: "POST", body: { nro: Number(nro) } });
@@ -304,6 +330,11 @@ async function loadDB(){
   ensureCatList("estadosVehiculo", ["Disponible","En ruta","En taller","Fuera de servicio"]);
   ensureCatList("infracciones", ["Exceso de velocidad","Estacionamiento","Documentación","Otra"]);
   ensureCatList("tiposFlete", ["Nacional","Local","Interno"]);
+  // Flujo de estados del servicio (rutas): distinto del estado del vehículo.
+  ensureCatList("estadosServicio", ["Asignado","Aceptado","En ruta","En destino","Finalizado","Cancelado"]);
+  ensureCatList("tiposIncidencia", ["Accidente de tránsito","Falla mecánica","Retraso de entrega","Daño de carga","Problema con cliente","Robo o pérdida","Conducta del conductor","Otro"]);
+  ensureCatList("gravedadIncidencia", ["Baja","Media","Alta","Crítica"]);
+  ensureCatList("estadosIncidencia", ["Abierta","En revisión","Resuelta","Cerrada"]);
   if(!Array.isArray(CAT.marcaModelo)){ CAT.marcaModelo = []; catRepaired = true; }
   if(!Array.isArray(CAT.tiposMantenimiento) || !CAT.tiposMantenimiento.length){
     CAT.tiposMantenimiento = ["Preventivo","Correctivo"];
@@ -322,8 +353,8 @@ async function loadDB(){
   else { LOG = []; await persistLog(); }
 }
 /* persistDB ahora solo sincroniza filas puntuales marcadas como cambiadas
-   (ver flushModule más arriba) — ya no hay ningún "borrar todo" salvo en
-   resetAll(), que es una acción explícita y confirmada por el usuario.
+   (ver flushModule más arriba) — ya no hay ningún "borrar todo" salvo la
+   restauración explícita de un respaldo completo (ver restoreFullBackup).
    Se mantiene la cola _dbWriteChain para que los guardados se ejecuten uno
    por uno (evita condiciones de carrera al escribir), pero al ser
    incremental, aunque se solaparan no podrían borrar datos ajenos. */
@@ -345,7 +376,8 @@ async function persistTrash(){ await saveKey(LS_TRASH, TRASH); markSaved(); }
 async function persistLog(){ await saveKey(LS_LOG, LOG); markSaved(); }
 
 function logActivity(moduleKey, action, nro, summary){
-  LOG.unshift({ id: uid(), ts: new Date().toISOString(), moduleKey, action, nro, summary });
+  const usuario = currentAdmin ? (currentAdmin.nombre || currentAdmin.email) : null;
+  LOG.unshift({ id: uid(), ts: new Date().toISOString(), moduleKey, action, nro, summary, usuario });
   if(LOG.length > 3000) LOG.length = 3000;
   persistLog();
 }
@@ -545,6 +577,7 @@ const MODULES = {
       { key:"docIdentidad", label:"Doc. identidad", kind:"text" },
       { key:"telefono", label:"Teléfono", kind:"text" },
       { key:"calificacion", label:"Calificación", kind:"select", options:()=>[1,2,3,4,5], stars:true },
+      { key:"licenciaPdf", label:"Licencia de conducir (PDF)", kind:"file", accept:"application/pdf", wide:true },
     ],
     summary: r => `${r.nombres || ""} ${r.apellidos || ""}`.trim(),
   },
@@ -568,6 +601,7 @@ const MODULES = {
       { key:"fechaLlegada", label:"Fecha llegada", kind:"date" },
       { key:"placa", label:"Placa", kind:"select", options:placasFlota, required:true, plate:true },
       { key:"estado", label:"Estado vehículo", kind:"select", options:()=>CAT.estadosVehiculo, badge:true },
+      { key:"estadoServicio", label:"Estado del servicio", kind:"select", options:()=>CAT.estadosServicio, required:true, badge:true },
       { key:"conductor", label:"Conductor", kind:"select", options:nombresConductores, required:true },
       { key:"obra", label:"Obra", kind:"combo", options:obrasCatalogo, catalogKey:"obras", uppercase:true, required:true },
       { key:"solicitadoPor", label:"Solicitado por", kind:"text" },
@@ -661,9 +695,29 @@ const MODULES = {
     // (o con otro dentro del mismo archivo), se omite en vez de duplicarlo.
     dedupeFields: ["obra","descripcion","realizado","lugar","nroRepor","nroGuia","valorFlete"],
   },
+
+  incidencias: {
+    label: "Incidencias", icon:"⚠️", group:"Operación",
+    columns: [
+      { key:"fecha", label:"Fecha", kind:"date", required:true },
+      { key:"rutaNro", label:"N° de ruta asociada", kind:"number", numeric:true },
+      { key:"placa", label:"Placa", kind:"select", options:placasFlota, plate:true },
+      { key:"conductor", label:"Conductor", kind:"select", options:nombresConductores, required:true },
+      { key:"tipo", label:"Tipo de incidencia", kind:"select", options:()=>CAT.tiposIncidencia, required:true, badge:true },
+      { key:"gravedad", label:"Gravedad", kind:"select", options:()=>CAT.gravedadIncidencia, required:true, badge:true },
+      { key:"descripcion", label:"Descripción", kind:"textarea", wide:true, required:true },
+      { key:"evidencia", label:"Evidencia (foto)", kind:"image", wide:true },
+      { key:"estado", label:"Estado", kind:"select", options:()=>CAT.estadosIncidencia, required:true, badge:true },
+      { key:"fechaResolucion", label:"Fecha de resolución", kind:"date" },
+      { key:"solucion", label:"Solución aplicada", kind:"textarea", wide:true },
+      { key:"reportadoPor", label:"Reportado por", kind:"text" },
+      { key:"observaciones", label:"Observaciones", kind:"textarea", wide:true },
+    ],
+    summary: r => `${r.tipo || "Incidencia"} · ${r.placa || r.conductor || ""}`,
+  },
 };
 
-const MODULE_ORDER = ["flota","rutas","fletes","mantenimiento","seguros","impuestos","multas","conductores","talleres"];
+const MODULE_ORDER = ["flota","rutas","fletes","mantenimiento","seguros","impuestos","multas","incidencias","conductores","talleres"];
 _dirty = emptyDirty(); // recién acá MODULE_ORDER ya existe
 
 /* ==========================================================================
@@ -695,13 +749,26 @@ function renderSidebar(){
     }
   });
 
+  html += `<div class="nav-group-label">Seguimiento</div>
+    <button class="nav-item ${currentModule==='mapa'?'active':''}" data-nav="mapa">
+      <span class="ico">📍</span><span>Mapa operacional</span>
+      <span class="count">${rutasActivasConUbicacion().length}</span></button>
+    <button class="nav-item ${currentModule==='historialOps'?'active':''}" data-nav="historialOps">
+      <span class="ico">🕓</span><span>Historial de operaciones</span></button>`;
+
   html += `<div class="nav-group-label">Configuración</div>
     <button class="nav-item ${currentModule==='catalogos'?'active':''}" data-nav="catalogos">
       <span class="ico">📋</span><span>Catálogos</span></button>`;
+  if(isFullAdmin()){
+    html += `<button class="nav-item ${currentModule==='usuarios'?'active':''}" data-nav="usuarios">
+      <span class="ico">👤</span><span>Usuarios</span></button>`;
+  }
 
   html += `<div class="nav-group-label">Historial</div>
     <button class="nav-item ${currentModule==='bitacora'?'active':''}" data-nav="bitacora">
       <span class="ico">📜</span><span>Registro de actividad</span></button>
+    <button class="nav-item ${currentModule==='auditoria'?'active':''}" data-nav="auditoria">
+      <span class="ico">🔒</span><span>Auditoría</span></button>
     <button class="nav-item ${currentModule==='papelera'?'active':''}" data-nav="papelera">
       <span class="ico">🗑️</span><span>Papelera</span><span class="count">${trashCount()}</span></button>`;
 
@@ -760,9 +827,13 @@ function closeMobileSidebar(){
 function renderMain(){
   if(currentModule === "dashboard") return renderDashboard();
   if(currentModule === "catalogos") return renderCatalogos();
+  if(currentModule === "usuarios") return renderUsuarios();
   if(currentModule === "bitacora") return renderBitacora();
+  if(currentModule === "auditoria") return renderAuditoria();
   if(currentModule === "papelera") return renderPapelera();
   if(currentModule === "facturas") return renderFacturas();
+  if(currentModule === "mapa") return renderMapa();
+  if(currentModule === "historialOps") return renderHistorialOperaciones();
   return renderModule(currentModule);
 }
 
@@ -817,6 +888,17 @@ function renderDashboard(){
 
   const mantenimientosEnCurso = DB.mantenimiento.filter(m => m.fechaEntrada && !m.fechaSalida).length;
 
+  const incidenciasAbiertas = DB.incidencias.filter(i => i.estado === "Abierta" || i.estado === "En revisión");
+  const incidenciasCriticas = incidenciasAbiertas.filter(i => i.gravedad === "Alta" || i.gravedad === "Crítica");
+
+  // ---- servicios activos por estado (flujo asignado -> ... -> finalizado) ----
+  const servicioColors = { "Asignado":"var(--route)", "Aceptado":"var(--accent)", "En ruta":"var(--warning)", "En destino":"var(--success)" };
+  const serviciosActivos = DB.rutas.filter(r => !["Finalizado","Cancelado"].includes(r.estadoServicio || "Asignado"));
+  const servicioCounts = {};
+  serviciosActivos.forEach(r => { const e = r.estadoServicio || "Asignado"; servicioCounts[e] = (servicioCounts[e]||0) + 1; });
+  const servicioRows = Object.entries(servicioCounts)
+    .map(([label,value])=>({ label, value, color: servicioColors[label] || "var(--route)" }));
+
   // ---- ingresos por mes (últimos 6 meses, según rutas) ----
   const meses6 = ultimosNMeses(6);
   const ingresosPorMesMap = {};
@@ -859,6 +941,7 @@ function renderDashboard(){
       <div class="kpi ${multasPendientes.length?'danger':''}" style="--kpi-color:${multasPendientes.length?'var(--danger)':'var(--success)'}"><div class="label">Multas por pagar</div><div class="value">$ ${fmtMoney(totalDeuda)}</div><div class="sub">${multasPendientes.length} pendiente(s)</div></div>
       <div class="kpi" style="--kpi-color:var(--route)"><div class="label">Fletes registrados</div><div class="value">${String(DB.fletes.length).padStart(2,"0")}</div><div class="sub">${DB.rutas.length} rutas de viaje</div></div>
       <div class="kpi ${mantenimientosEnCurso?'warn':''}" style="--kpi-color:${mantenimientosEnCurso?'var(--warning)':'var(--success)'}"><div class="label">Mantenimientos en curso</div><div class="value">${String(mantenimientosEnCurso).padStart(2,"0")}</div><div class="sub">vehículos en taller</div></div>
+      <div class="kpi ${incidenciasAbiertas.length?'danger':''}" style="--kpi-color:${incidenciasAbiertas.length?'var(--danger)':'var(--success)'}"><div class="label">Incidencias abiertas</div><div class="value">${String(incidenciasAbiertas.length).padStart(2,"0")}</div><div class="sub">${incidenciasCriticas.length} de gravedad alta/crítica</div></div>
     </div>
 
     <div class="dash-grid dash-grid-3">
@@ -873,12 +956,26 @@ function renderDashboard(){
       </div>
 
       <div class="panel">
+        <h3><span class="ico">🧭</span> Servicios activos por estado</h3>
+        <div class="hbar-list">${hbarListHTML(servicioRows, { emptyLabel:"Sin servicios en curso." })}</div>
+      </div>
+    </div>
+
+    <div class="dash-grid dash-grid-3">
+      <div class="panel">
         <h3><span class="ico">🔔</span> Atención requerida</h3>
         ${porVencer.map(r=>`
           <div class="mini-row"><span>${plateChip(r.placa)} póliza ${esc(r.aseguradora)}</span><span class="tag ${r.estadoPoliza==='Vencido'?'tag-danger':'tag-warn'}">${r.estadoPoliza}</span></div>`).join("") }
         ${multasPendientes.map(r=>`
           <div class="mini-row"><span>${plateChip(r.placa)} multa ${esc(r.infraccion)}</span><span class="tag tag-danger">Debe $ ${fmtMoney(r.debe)}</span></div>`).join("") }
         ${(!porVencer.length && !multasPendientes.length) ? `<div class="empty-note">Todo en orden. Sin pendientes por ahora.</div>` : ""}
+      </div>
+
+      <div class="panel">
+        <h3><span class="ico">⚠️</span> Incidencias abiertas</h3>
+        ${incidenciasAbiertas.slice(0,6).map(r=>`
+          <div class="mini-row"><span>${plateChip(r.placa || "—")} ${esc(r.tipo||"")}</span><span class="tag ${(r.gravedad==='Alta'||r.gravedad==='Crítica')?'tag-danger':'tag-warn'}">${esc(r.gravedad||r.estado)}</span></div>`).join("") }
+        ${!incidenciasAbiertas.length ? `<div class="empty-note">Sin incidencias abiertas.</div>` : ""}
       </div>
     </div>
 
@@ -914,6 +1011,35 @@ function openImageLightbox(src){
     </div>`;
   $("#modalClose").addEventListener("click", closeModal);
   $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
+}
+
+/* Convierte un data URL (base64) en un Blob, para poder mostrarlo en un
+   <iframe> con una URL liviana (URL.createObjectURL) en vez de inyectar
+   el base64 completo en el atributo src, que en PDFs grandes puede pesar
+   varios MB y hacer que el navegador vaya lento. */
+function dataURLToBlob(dataUrl){
+  const [meta, base64] = dataUrl.split(",");
+  const mimeMatch = /data:(.*?);base64/.exec(meta);
+  const mime = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for(let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+/* Visor de PDF: abre el contenido (licencia de conducir, etc.) en un
+   modal a pantalla casi completa, igual que el lightbox de fotos. */
+function openPdfViewer(dataUrl){
+  if(!dataUrl) return;
+  const blobUrl = URL.createObjectURL(dataURLToBlob(dataUrl));
+  $("#modalRoot").innerHTML = `
+    <div class="overlay lightbox-overlay" id="overlay">
+      <button class="modal-close lightbox-close" id="modalClose">✕</button>
+      <iframe src="${blobUrl}" class="pdf-viewer-frame"></iframe>
+    </div>`;
+  const cleanup = () => { URL.revokeObjectURL(blobUrl); closeModal(); };
+  $("#modalClose").addEventListener("click", cleanup);
+  $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") cleanup(); });
 }
 
 /* ---------------------------------------------------------------- FACTURAS (Operación) */
@@ -1184,6 +1310,7 @@ function renderModule(key){
     $$('[data-edit]').forEach(b=> b.addEventListener('click', ()=> openForm(key, b.dataset.edit)));
     $$('[data-del]').forEach(b=> b.addEventListener('click', ()=> confirmDelete(key, b.dataset.del)));
     $$('.thumb[data-lightbox]').forEach(img => img.addEventListener('click', ()=> openImageLightbox(img.dataset.lightbox)));
+    $$('.pdf-view-btn[data-pdf-cell]').forEach(btn => btn.addEventListener('click', ()=> openPdfViewer(btn.dataset.pdfCell)));
   }
 }
 
@@ -1206,6 +1333,7 @@ function cellValue(col, row){
   let v = row[col.key];
   if(col.key === "nro") return `<b>#${v}</b>`;
   if(col.kind === "image") return v ? `<img src="${v}" class="thumb" data-lightbox="${esc(v)}" title="Ver foto">` : `<span class="badge badge-neutral">Sin foto</span>`;
+  if(col.kind === "file") return v ? `<button type="button" class="btn btn-sm pdf-view-btn" data-pdf-cell="${esc(v)}">👁️ Ver PDF</button>` : `<span class="badge badge-neutral">Sin archivo</span>`;
   if(col.plate) return plateChip(v);
   if(col.stars) return `<span class="stars">${"★".repeat(v||0)}${"☆".repeat(5-(v||0))}</span>`;
   if(col.badge) return badgeFor(v);
@@ -1255,6 +1383,26 @@ function fileToCompressedDataURL(file, maxDim=1000, quality=0.72){
   });
 }
 
+/* Lee un archivo (p. ej. el PDF de una licencia de conducir) como data URL,
+   sin comprimir —a diferencia de fileToCompressedDataURL, que es solo para
+   fotos—, validando tipo MIME y un tamaño máximo razonable. */
+function fileToDataURL(file, { acceptPrefix = "", maxSizeMB = 8 } = {}){
+  return new Promise((resolve, reject) => {
+    if(acceptPrefix && !file.type.startsWith(acceptPrefix)){
+      reject(new Error(`El archivo debe ser de tipo ${acceptPrefix === "application/pdf" ? "PDF" : acceptPrefix}`));
+      return;
+    }
+    if(file.size > maxSizeMB * 1024 * 1024){
+      reject(new Error(`El archivo supera el tamaño máximo permitido (${maxSizeMB} MB)`));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("No se pudo leer el archivo"));
+    reader.readAsDataURL(file);
+  });
+}
+
 function openForm(moduleKey, nro){
   const cfg = MODULES[moduleKey];
   const existing = nro ? DB[moduleKey].find(r => String(r.nro) === String(nro)) : null;
@@ -1265,10 +1413,14 @@ function openForm(moduleKey, nro){
   editing = { module: moduleKey, nro: existing ? existing.nro : null };
   const draft = existing ? {...existing} : {};
 
-  const fields = cfg.columns.filter(c => c.kind !== "computed" && c.kind !== "image");
+  const fields = cfg.columns.filter(c => c.kind !== "computed" && c.kind !== "image" && c.kind !== "file");
   const imageFields = cfg.columns.filter(c => c.kind === "image");
   const imageDraft = {};
   imageFields.forEach(c => { imageDraft[c.key] = draft[c.key] || ""; });
+
+  const fileFields = cfg.columns.filter(c => c.kind === "file");
+  const fileDraft = {};
+  fileFields.forEach(c => { fileDraft[c.key] = draft[c.key] || ""; });
 
   const imageFieldHtml = c => `
     <div class="form-field span2">
@@ -1287,6 +1439,58 @@ function openForm(moduleKey, nro){
         <input type="file" accept="image/*" id="file-gallery-${c.key}" data-image-input-gallery="${c.key}" hidden>
         ${val ? `<button type="button" class="btn btn-sm btn-danger" data-image-remove="${c.key}">Quitar</button>` : ""}
       </div>`;
+  }
+
+  const fileFieldHtml = c => `
+    <div class="form-field span2">
+      <label>${esc(c.label)}</label>
+      <div class="file-field" data-file-field="${c.key}">${renderFileFieldInner(c)}</div>
+    </div>`;
+
+  // Antes de subir un archivo: botón "Subir PDF". Una vez cargado, el
+  // mismo lugar pasa a mostrar el botón "Ver PDF" (que abre el visor) más
+  // la opción de quitarlo para reemplazarlo por otro.
+  function renderFileFieldInner(c){
+    const val = fileDraft[c.key];
+    if(val){
+      return `
+        <div class="file-actions">
+          <button type="button" class="btn btn-sm" data-file-view="${c.key}">👁️ Ver PDF</button>
+          <button type="button" class="btn btn-sm btn-danger" data-file-remove="${c.key}">Quitar</button>
+        </div>`;
+    }
+    return `
+      <div class="file-actions">
+        <label class="btn btn-sm" for="file-input-${c.key}">📄 Subir PDF</label>
+        <input type="file" accept="${c.accept || 'application/pdf'}" id="file-input-${c.key}" data-file-input="${c.key}" hidden>
+      </div>`;
+  }
+
+  function bindFileField(c){
+    const wrap = $(`[data-file-field="${c.key}"]`);
+    if(!wrap) return;
+    const input = wrap.querySelector(`[data-file-input="${c.key}"]`);
+    if(input){
+      input.addEventListener("change", async () => {
+        const file = input.files[0];
+        if(!file) return;
+        try{
+          fileDraft[c.key] = await fileToDataURL(file, { acceptPrefix: "application/pdf", maxSizeMB: 8 });
+          wrap.innerHTML = renderFileFieldInner(c);
+          bindFileField(c);
+        }catch(err){ toast(err.message); }
+      });
+    }
+    const viewBtn = wrap.querySelector(`[data-file-view="${c.key}"]`);
+    if(viewBtn) viewBtn.addEventListener("click", () => openPdfViewer(fileDraft[c.key]));
+    const removeBtn = wrap.querySelector(`[data-file-remove="${c.key}"]`);
+    if(removeBtn){
+      removeBtn.addEventListener("click", () => {
+        fileDraft[c.key] = "";
+        wrap.innerHTML = renderFileFieldInner(c);
+        bindFileField(c);
+      });
+    }
   }
 
   // Habilita "Marcar realizado" (solo Rutas) únicamente cuando ya existe la
@@ -1377,6 +1581,7 @@ function openForm(moduleKey, nro){
           <div class="form-grid">
             ${fields.map(inputHtml).join("")}
             ${imageFields.map(imageFieldHtml).join("")}
+            ${fileFields.map(fileFieldHtml).join("")}
           </div>
           ${computedHtml}
         </div>
@@ -1393,6 +1598,7 @@ function openForm(moduleKey, nro){
   $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
 
   imageFields.forEach(bindImageField);
+  fileFields.forEach(bindFileField);
 
   // cascading selects (marca -> modelo, tipo -> paquete)
   $$('[data-cascade]').forEach(sel => {
@@ -1408,19 +1614,19 @@ function openForm(moduleKey, nro){
     });
   });
 
-  $("#btnSave").addEventListener("click", () => submitForm(moduleKey, fields, imageFields, imageDraft));
+  $("#btnSave").addEventListener("click", () => submitForm(moduleKey, fields, imageFields, imageDraft, fileFields, fileDraft));
 
   // Botón extra solo en Rutas de viaje (panel admin): guarda la ruta,
   // la marca como realizada y salta directo al módulo de Fletes. Solo se
   // habilita cuando ya existe la foto Report.
   const btnSaveComplete = $("#btnSaveComplete");
   if(btnSaveComplete){
-    btnSaveComplete.addEventListener("click", () => submitForm(moduleKey, fields, imageFields, imageDraft, { markCompleted: true }));
+    btnSaveComplete.addEventListener("click", () => submitForm(moduleKey, fields, imageFields, imageDraft, fileFields, fileDraft, { markCompleted: true }));
   }
   updateSaveCompleteState();
 }
 
-async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {}){
+async function submitForm(moduleKey, fields, imageFields, imageDraft, fileFields, fileDraft, opts = {}){
   const cfg = MODULES[moduleKey];
   const data = {};
   let missing = null;
@@ -1435,6 +1641,7 @@ async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {})
     data[c.key] = v;
   });
   (imageFields || []).forEach(c => { data[c.key] = (imageDraft && imageDraft[c.key]) || ""; });
+  (fileFields || []).forEach(c => { data[c.key] = (fileDraft && fileDraft[c.key]) || ""; });
 
   // "Guardar y marcar Realizado" (solo Rutas, panel admin): si no se cargó
   // fecha de llegada, se completa con la fecha de hoy para dejar la ruta
@@ -1470,7 +1677,8 @@ async function submitForm(moduleKey, fields, imageFields, imageDraft, opts = {})
     // podría estar creando otra ruta en este mismo instante desde su teléfono.
     const payload = sanitizeRowForDb("rutas", data);
     delete payload.nro;
-    const { data: result, error } = await apiFetch("rutas/save.php", { method: "POST", body: payload });
+    const { data: result, error } = await guardarRutaEnServidor(payload);
+    if(error === "cancelado") return;
     if(error){ console.error("Error al crear ruta", error); toast("Error al crear la ruta"); return; }
     data.nro = result.row.nro;
     DB.rutas.push(data);
@@ -1632,6 +1840,218 @@ function renderPapelera(){
   $$('[data-purge]').forEach(b => b.addEventListener('click', () => purgeFromTrash(b.dataset.mod, b.dataset.purge)));
 }
 
+/* ==========================================================================
+   MAPA OPERACIONAL (#11) + SEGUIMIENTO GPS (#10, interino vía navegador)
+   ========================================================================== */
+const ESTADOS_ACTIVOS_RUTA = ["Asignado","Aceptado","En ruta","En destino"];
+
+// Rutas activas que ya tienen al menos una posición GPS reportada por el
+// conductor. Mientras la flota no tenga GPS embarcado, esta es la fuente:
+// el teléfono del conductor manda su posición mientras el servicio está en
+// curso (ver conductor/js/app.js → pingUbicacion).
+function rutasActivasConUbicacion(){
+  if(!DB || !DB.rutas) return [];
+  return DB.rutas.filter(r => ESTADOS_ACTIVOS_RUTA.includes(r.estadoServicio || "Asignado") && r.lat != null && r.lng != null);
+}
+
+let _mapaLeaflet = null;
+let _mapaMarkers = [];
+
+const ESTADO_MAP_COLOR = {
+  "Asignado":"#94a3b8", "Aceptado":"#3b82f6", "En ruta":"#f59e0b", "En destino":"#22c55e",
+};
+
+function renderMapa(){
+  const conGps = rutasActivasConUbicacion();
+  const activasSinGps = DB.rutas.filter(r => ESTADOS_ACTIVOS_RUTA.includes(r.estadoServicio || "Asignado") && (r.lat == null || r.lng == null));
+
+  $("#main").innerHTML = `
+    <div class="topbar">
+      <div><span class="eyebrow">Seguimiento</span><h1>📍 Mapa operacional</h1></div>
+    </div>
+    <p style="color:var(--ink-soft); max-width:760px; margin-bottom:14px;">
+      Ubicación de los servicios activos, reportada por el teléfono del conductor mientras usa la app
+      (todavía no hay GPS instalado en los vehículos de la flota — en cuanto lo haya, puede alimentar
+      este mismo mapa sin cambios). Se actualiza solo mientras el conductor tiene la app abierta y dio
+      permiso de ubicación.
+    </p>
+    <div id="mapaOperacional" style="height:460px; border-radius:14px; overflow:hidden; border:1px solid var(--border);"></div>
+    ${activasSinGps.length ? `
+      <div class="panel" style="margin-top:16px;">
+        <h3><span class="ico">📡</span> Servicios activos sin ubicación todavía <span class="count-pill">${activasSinGps.length}</span></h3>
+        ${activasSinGps.map(r => `
+          <div class="mini-row">
+            <span>${esc(r.origen||"—")} → ${esc(r.destino||"—")} · ${esc(r.conductor||"—")} ${r.placa?`· ${esc(r.placa)}`:""}</span>
+            <span class="badge badge-neutral">${esc(r.estadoServicio || "Asignado")}</span>
+          </div>`).join("")}
+      </div>` : ``}
+    ${(!conGps.length && !activasSinGps.length) ? `<div class="empty-state" style="margin-top:16px;"><div class="big">📍</div>No hay servicios activos en este momento.</div>` : ``}
+  `;
+
+  ensureLeaflet(() => {
+    const container = $("#mapaOperacional");
+    if(!container) return;
+    _mapaLeaflet = L.map(container).setView([-33.45, -70.65], 6); // centro por defecto: Chile central
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18, attribution: '&copy; OpenStreetMap contributors',
+    }).addTo(_mapaLeaflet);
+
+    _mapaMarkers = [];
+    conGps.forEach(r => {
+      const color = ESTADO_MAP_COLOR[r.estadoServicio] || "#64748b";
+      const icon = L.divIcon({
+        className: "", html: `<div style="width:16px;height:16px;border-radius:50%;background:${color};border:2px solid #fff;box-shadow:0 0 0 1px ${color}"></div>`,
+        iconSize: [16,16], iconAnchor: [8,8],
+      });
+      const marker = L.marker([r.lat, r.lng], { icon }).addTo(_mapaLeaflet);
+      marker.bindPopup(`
+        <b>${esc(r.origen||"—")} → ${esc(r.destino||"—")}</b><br>
+        ${esc(r.conductor||"—")} ${r.placa?`· ${esc(r.placa)}`:""}<br>
+        Estado: ${esc(r.estadoServicio||"Asignado")}<br>
+        Última actualización: ${fmtDateTime(r.ubicacionTs)}
+      `);
+      _mapaMarkers.push(marker);
+    });
+
+    if(_mapaMarkers.length){
+      const group = L.featureGroup(_mapaMarkers);
+      _mapaLeaflet.fitBounds(group.getBounds().pad(0.3));
+    }
+  });
+}
+
+// Carga Leaflet (CSS+JS) desde CDN una sola vez, de forma perezosa: así el
+// resto del panel no paga el costo de cargarlo si nadie visita el Mapa.
+let _leafletLoading = null;
+function ensureLeaflet(cb){
+  if(window.L){ cb(); return; }
+  if(!_leafletLoading){
+    _leafletLoading = new Promise(resolve => {
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+      document.head.appendChild(link);
+      const script = document.createElement("script");
+      script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+      script.onload = resolve;
+      document.head.appendChild(script);
+    });
+  }
+  _leafletLoading.then(cb);
+}
+
+/* ==========================================================================
+   HISTORIAL DE OPERACIONES (#17) — consulta de servicios realizados,
+   con filtros por período, vehículo, conductor y obra/cliente. Distinto
+   de la Bitácora (que es un log crudo de altas/bajas/ediciones) y de la
+   Papelera (registros borrados): esto es la vista operacional para
+   responder "¿qué se transportó, cuándo, con qué camión y quién lo hizo?".
+   ========================================================================== */
+let histFiltros = { desde:"", hasta:"", placa:"", conductor:"", obra:"" };
+
+function renderHistorialOperaciones(){
+  const placas = [...new Set(DB.rutas.map(r=>r.placa).filter(Boolean))].sort();
+  const conductoresList = [...new Set(DB.rutas.map(r=>r.conductor).filter(Boolean))].sort((a,b)=>a.localeCompare(b,"es"));
+  const obras = [...new Set(DB.rutas.map(r=>r.obra).filter(Boolean))].sort((a,b)=>a.localeCompare(b,"es"));
+
+  $("#main").innerHTML = `
+    <div class="topbar">
+      <div><span class="eyebrow">Seguimiento</span><h1>🕓 Historial de operaciones</h1></div>
+      <div class="topbar-actions"><span class="count-pill" id="histCount"></span></div>
+    </div>
+    <p style="color:var(--ink-soft); max-width:760px; margin-bottom:14px;">
+      Todos los servicios (rutas) registrados, filtrables por período, vehículo, conductor u obra/cliente.
+    </p>
+    <div class="toolbar">
+      <label style="display:flex;flex-direction:column;font-size:12px;color:var(--ink-soft);gap:4px;">Desde
+        <input type="date" id="histDesde" value="${histFiltros.desde}"></label>
+      <label style="display:flex;flex-direction:column;font-size:12px;color:var(--ink-soft);gap:4px;">Hasta
+        <input type="date" id="histHasta" value="${histFiltros.hasta}"></label>
+      <select class="filter-select" id="histPlaca"><option value="">Vehículo: Todos</option>${placas.map(p=>`<option value="${esc(p)}" ${histFiltros.placa===p?"selected":""}>${esc(p)}</option>`).join("")}</select>
+      <select class="filter-select" id="histConductor"><option value="">Conductor: Todos</option>${conductoresList.map(c=>`<option value="${esc(c)}" ${histFiltros.conductor===c?"selected":""}>${esc(c)}</option>`).join("")}</select>
+      <select class="filter-select" id="histObra"><option value="">Obra/cliente: Todas</option>${obras.map(o=>`<option value="${esc(o)}" ${histFiltros.obra===o?"selected":""}>${esc(o)}</option>`).join("")}</select>
+      <button class="btn btn-sm" id="histLimpiar">Limpiar filtros</button>
+    </div>
+    <div class="table-wrap" id="histTableWrap"></div>
+  `;
+
+  const paint = () => {
+    let rows = DB.rutas.slice();
+    if(histFiltros.desde) rows = rows.filter(r => r.fechaSalida && r.fechaSalida >= histFiltros.desde);
+    if(histFiltros.hasta) rows = rows.filter(r => r.fechaSalida && r.fechaSalida <= histFiltros.hasta);
+    if(histFiltros.placa) rows = rows.filter(r => r.placa === histFiltros.placa);
+    if(histFiltros.conductor) rows = rows.filter(r => r.conductor === histFiltros.conductor);
+    if(histFiltros.obra) rows = rows.filter(r => r.obra === histFiltros.obra);
+    rows.sort((a,b) => (b.fechaSalida||"").localeCompare(a.fechaSalida||""));
+
+    $("#histCount").textContent = `${rows.length} servicio(s)`;
+    $("#histTableWrap").innerHTML = rows.length ? `
+      <table><thead><tr>
+        <th class="num">Nro</th><th>Salida</th><th>Llegada</th><th>Vehículo</th><th>Conductor</th>
+        <th>Obra/cliente</th><th>Origen → Destino</th><th>Estado</th><th class="num">Ingreso ($)</th>
+      </tr></thead><tbody>
+        ${rows.map(r => `<tr>
+          <td class="num"><b>#${r.nro}</b></td>
+          <td>${fmtDate(r.fechaSalida)}</td>
+          <td>${fmtDate(r.fechaLlegada)}</td>
+          <td>${plateChip(r.placa)}</td>
+          <td>${esc(r.conductor||"—")}</td>
+          <td>${esc(r.obra||"—")}</td>
+          <td>${esc(r.origen||"—")} → ${esc(r.destino||"—")}</td>
+          <td>${badgeFor(r.estadoServicio||"Asignado")}</td>
+          <td class="num">$ ${fmtMoney((Number(r.pesoCarga)||0) * (Number(r.costoPorKg)||0))}</td>
+        </tr>`).join("")}
+      </tbody></table>` : `<div class="empty-state"><div class="big">🕓</div>Ningún servicio coincide con estos filtros.</div>`;
+  };
+
+  $("#histDesde").addEventListener("change", e => { histFiltros.desde = e.target.value; paint(); });
+  $("#histHasta").addEventListener("change", e => { histFiltros.hasta = e.target.value; paint(); });
+  $("#histPlaca").addEventListener("change", e => { histFiltros.placa = e.target.value; paint(); });
+  $("#histConductor").addEventListener("change", e => { histFiltros.conductor = e.target.value; paint(); });
+  $("#histObra").addEventListener("change", e => { histFiltros.obra = e.target.value; paint(); });
+  $("#histLimpiar").addEventListener("click", () => { histFiltros = { desde:"", hasta:"", placa:"", conductor:"", obra:"" }; renderHistorialOperaciones(); });
+
+  paint();
+}
+
+/* ==========================================================================
+   AUDITORÍA (#19, refuerzo) — a diferencia de la Bitácora (que solo vive en
+   el navegador y solo registra acciones hechas desde el panel), esta tabla
+   vive en el servidor y registra TODO: acciones del panel Y del conductor
+   (cambios de estado, reportes, etc.), con quién las hizo realmente
+   (resuelto siempre en el backend, nunca por lo que mande el navegador).
+   ========================================================================== */
+let auditoriaCache = null;
+
+async function renderAuditoria(){
+  $("#main").innerHTML = `
+    <div class="topbar">
+      <div><span class="eyebrow">Historial</span><h1>🔒 Auditoría</h1></div>
+    </div>
+    <p style="color:var(--ink-soft); max-width:760px; margin-bottom:14px;">
+      Registro fino de "quién hizo qué": incluye acciones del panel (admin/operador) y de la app del
+      conductor (cambios de estado, reportes de cierre), con el actor resuelto siempre en el servidor.
+    </p>
+    <div class="table-wrap" id="auditTableWrap">Cargando…</div>
+  `;
+
+  const { data, error } = await apiFetch("auditoria_log/list.php");
+  if(error){ $("#auditTableWrap").innerHTML = `<div class="empty-state">No se pudo cargar la auditoría.</div>`; return; }
+  auditoriaCache = data.rows || [];
+
+  const ACCION_LABELS = { create:"Creado", update:"Actualizado", cambio_estado:"Cambio de estado" };
+  $("#auditTableWrap").innerHTML = auditoriaCache.length ? `
+    <table><thead><tr><th>Fecha</th><th>Actor</th><th>Acción</th><th>Entidad</th><th>Detalle</th></tr></thead><tbody>
+      ${auditoriaCache.map(a => `<tr>
+        <td>${fmtDateTime(a.creado_en)}</td>
+        <td><span class="badge ${a.actor_tipo==='admin'?'badge-neutral':'badge-accent'}">${esc(a.actor_tipo==='admin'?'Panel':'Conductor')}</span> ${esc(a.actor_nombre)}</td>
+        <td>${esc(ACCION_LABELS[a.accion] || a.accion)}</td>
+        <td>${esc(a.entidad)}${a.entidad_id?` #${a.entidad_id}`:""}</td>
+        <td>${esc(a.detalle||"—")}</td>
+      </tr>`).join("")}
+    </tbody></table>` : `<div class="empty-state"><div class="big">🔒</div>Todavía no hay eventos de auditoría.</div>`;
+}
+
 /* ---------------------------------------------------------------- BITÁCORA (registro de actividad diaria) */
 const ACTION_LABELS = { create:"Creado", update:"Actualizado", delete:"Eliminado", restore:"Restaurado" };
 const ACTION_BADGES = { create:"badge-ok", update:"badge-neutral", delete:"badge-danger", restore:"badge-warn" };
@@ -1659,7 +2079,7 @@ function renderBitacora(){
       ${g.entries.map(e => {
         const cfg = MODULES[e.moduleKey];
         return `<div class="mini-row">
-          <span>${fmtTime(e.ts)} · ${cfg ? cfg.icon : "•"} ${cfg ? esc(cfg.label) : esc(e.moduleKey)} — ${esc(e.summary || ("#"+e.nro))}</span>
+          <span>${fmtTime(e.ts)} · ${cfg ? cfg.icon : "•"} ${cfg ? esc(cfg.label) : esc(e.moduleKey)} — ${esc(e.summary || ("#"+e.nro))}${e.usuario ? ` <span class="empty-note" style="margin-left:6px;">por ${esc(e.usuario)}</span>` : ""}</span>
           <span class="badge ${ACTION_BADGES[e.action] || "badge-neutral"}">${esc(ACTION_LABELS[e.action] || e.action)}</span>
         </div>`;
       }).join("")}
@@ -1756,6 +2176,203 @@ function catalogCard(c){
 }
 
 /* ==========================================================================
+   USUARIOS Y ROLES (solo visible/editable con rol "admin")
+   ========================================================================== */
+function renderUsuarios(){
+  if(!isFullAdmin()){
+    // Defensa extra en el front por si alguien fuerza el hash de navegación:
+    // el backend igual rechaza estas llamadas con 403 para un operador.
+    $("#main").innerHTML = `<div class="empty-state"><div class="big">🔒</div>No tienes permisos para ver esta sección.</div>`;
+    return;
+  }
+  $("#main").innerHTML = `
+    <div class="topbar">
+      <div><span class="eyebrow">Configuración</span><h1>👤 Usuarios y roles</h1></div>
+      <button class="btn btn-accent" id="btnAddUsuario">+ Nuevo usuario</button>
+    </div>
+    <p style="color:var(--ink-soft); max-width:640px; margin-bottom:18px;">
+      <b>Administrador</b>: acceso total, incluida esta pantalla y la restauración de respaldos completos.
+      <b>Operador/despachador</b>: gestiona fletes, rutas, flota, conductores e incidencias del día a día, pero no ve esta sección.
+    </p>
+    <div id="usuariosWrap"><div class="empty-state"><div class="big">⏳</div>Cargando usuarios…</div></div>
+  `;
+  $("#btnAddUsuario").addEventListener("click", () => openUsuarioForm(null));
+  loadUsuarios();
+}
+
+async function loadUsuarios(){
+  const { data, error } = await apiFetch("usuarios/list.php");
+  const wrap = $("#usuariosWrap");
+  if(!wrap) return; // el usuario ya navegó a otra sección
+  if(error){ wrap.innerHTML = `<div class="empty-state"><div class="big">⚠️</div>No se pudo cargar la lista de usuarios.</div>`; return; }
+  const rows = data.rows || [];
+  if(!rows.length){ wrap.innerHTML = `<div class="empty-state"><div class="big">👤</div>Sin usuarios registrados.</div>`; return; }
+  wrap.innerHTML = `<table><thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th></th></tr></thead><tbody>
+    ${rows.map(u => `
+      <tr>
+        <td>${esc(u.nombre)}</td>
+        <td>${esc(u.email)}</td>
+        <td><span class="badge ${u.rol==='admin'?'badge-ok':'badge-neutral'}">${u.rol==='admin'?'Administrador':'Operador/despachador'}</span></td>
+        <td class="actions"><div class="row-actions">
+          <button class="icon-btn" data-edit-usuario="${u.id}" title="Editar">✎</button>
+          ${u.id === currentAdmin.id ? "" : `<button class="icon-btn danger" data-del-usuario="${u.id}" title="Eliminar">✕</button>`}
+        </div></td>
+      </tr>`).join("")}
+  </tbody></table>`;
+  $$('[data-edit-usuario]', wrap).forEach(b => b.addEventListener('click', () => openUsuarioForm(rows.find(u => String(u.id) === b.dataset.editUsuario))));
+  $$('[data-del-usuario]', wrap).forEach(b => b.addEventListener('click', () => confirmDeleteUsuario(rows.find(u => String(u.id) === b.dataset.delUsuario))));
+}
+
+function openUsuarioForm(existing){
+  $("#modalRoot").innerHTML = `
+    <div class="overlay" id="overlay">
+      <div class="modal" style="max-width:440px">
+        <div class="modal-head"><h3>${existing ? "Editar usuario" : "Nuevo usuario"}</h3><button class="modal-close" id="modalClose">✕</button></div>
+        <div class="modal-body">
+          <div class="field"><label>Nombre</label><input id="uNombre" value="${existing ? esc(existing.nombre) : ""}" required></div>
+          <div class="field"><label>Correo</label><input id="uEmail" type="email" value="${existing ? esc(existing.email) : ""}" required></div>
+          <div class="field">
+            <label>Rol</label>
+            <select id="uRol">
+              <option value="operador" ${existing && existing.rol!=='admin' ? "selected":""}>Operador / despachador</option>
+              <option value="admin" ${existing && existing.rol==='admin' ? "selected":""}>Administrador</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>${existing ? "Nueva contraseña (dejar en blanco para no cambiarla)" : "Contraseña"}</label>
+            <input id="uPassword" type="password" autocomplete="new-password">
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" id="btnCancel">Cancelar</button>
+          <button class="btn btn-accent" id="btnSaveUsuario">Guardar</button>
+        </div>
+      </div>
+    </div>`;
+  $("#modalClose").addEventListener("click", closeModal);
+  $("#btnCancel").addEventListener("click", closeModal);
+  $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
+  $("#btnSaveUsuario").addEventListener("click", async () => {
+    const payload = {
+      id: existing ? existing.id : undefined,
+      nombre: $("#uNombre").value.trim(),
+      email: $("#uEmail").value.trim(),
+      rol: $("#uRol").value,
+      password: $("#uPassword").value,
+    };
+    if(!payload.nombre || !payload.email){ toast("Faltan el nombre o el correo"); return; }
+    if(!existing && !payload.password){ toast("Debes definir una contraseña"); return; }
+    const btn = $("#btnSaveUsuario");
+    btn.disabled = true;
+    const { error } = await apiFetch("usuarios/save.php", { method: "POST", body: payload });
+    btn.disabled = false;
+    if(error){ toast(error); return; }
+    closeModal();
+    toast(existing ? "Usuario actualizado" : "Usuario creado");
+    loadUsuarios();
+  });
+}
+
+function confirmDeleteUsuario(u){
+  if(!u) return;
+  $("#modalRoot").innerHTML = `
+    <div class="overlay" id="overlay">
+      <div class="modal" style="max-width:420px">
+        <div class="modal-head"><h3>Eliminar usuario</h3><button class="modal-close" id="modalClose">✕</button></div>
+        <div class="modal-body"><p>¿Eliminar a <b>${esc(u.nombre)}</b> (${esc(u.email)})? Perderá acceso al panel de inmediato.</p></div>
+        <div class="modal-foot">
+          <button class="btn" id="btnCancel">Cancelar</button>
+          <button class="btn btn-danger" id="btnConfirmDel">Sí, eliminar</button>
+        </div>
+      </div>
+    </div>`;
+  $("#modalClose").addEventListener("click", closeModal);
+  $("#btnCancel").addEventListener("click", closeModal);
+  $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
+  $("#btnConfirmDel").addEventListener("click", async () => {
+    const { error } = await apiFetch("usuarios/delete.php", { method: "POST", body: { id: u.id } });
+    closeModal();
+    if(error){ toast(error); return; }
+    toast("Usuario eliminado");
+    loadUsuarios();
+  });
+}
+
+/* ==========================================================================
+   NOTIFICACIONES — campanita del sidebar
+   ========================================================================== */
+function fmtNotifTime(iso){
+  if(!iso) return "";
+  const d = new Date(iso.replace(" ", "T"));
+  if(isNaN(d)) return "";
+  const diffMin = Math.round((Date.now() - d.getTime()) / 60000);
+  if(diffMin < 1) return "recién";
+  if(diffMin < 60) return `hace ${diffMin} min`;
+  const diffH = Math.round(diffMin/60);
+  if(diffH < 24) return `hace ${diffH} h`;
+  return d.toLocaleDateString("es-CL", { day:"2-digit", month:"2-digit" });
+}
+
+async function loadNotifications(){
+  const { data, error } = await apiFetch("notificaciones/list.php");
+  if(error) return;
+  notifState.rows = data.rows || [];
+  notifState.noLeidas = data.no_leidas || 0;
+  renderNotifBell();
+}
+
+function renderNotifBell(){
+  const badge = $("#notifBadge");
+  if(!badge) return;
+  if(notifState.noLeidas > 0){
+    badge.hidden = false;
+    badge.textContent = notifState.noLeidas > 9 ? "9+" : String(notifState.noLeidas);
+  } else {
+    badge.hidden = true;
+  }
+  const panel = $("#notifPanel");
+  if(panel && !panel.hidden) renderNotifPanel();
+}
+
+function renderNotifPanel(){
+  const panel = $("#notifPanel");
+  if(!panel) return;
+  if(!notifState.rows.length){
+    panel.innerHTML = `<div class="notif-panel-empty">Sin notificaciones todavía.</div>`;
+    return;
+  }
+  panel.innerHTML = notifState.rows.map(n => `
+    <div class="notif-item ${n.leida ? "" : "unread"}">
+      <span class="notif-msg">${esc(n.mensaje)}</span>
+      <span class="notif-time">${fmtNotifTime(n.fecha_creacion)}</span>
+    </div>`).join("");
+}
+
+function initNotifBell(){
+  const btn = $("#btnNotifBell");
+  const panel = $("#notifPanel");
+  if(!btn || !panel) return;
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const opening = panel.hidden;
+    panel.hidden = !panel.hidden;
+    if(opening){
+      renderNotifPanel();
+      if(notifState.noLeidas > 0){
+        await apiFetch("notificaciones/marcar_leidas.php", { method: "POST" });
+        notifState.rows.forEach(n => n.leida = true);
+        notifState.noLeidas = 0;
+        renderNotifBell();
+      }
+    }
+  });
+  document.addEventListener("click", (e) => {
+    if(!panel.hidden && !panel.contains(e.target) && e.target !== btn) panel.hidden = true;
+  });
+}
+
+
+/* ==========================================================================
    EXPORTAR / IMPORTAR — múltiples formatos de archivo
    Formatos de salida: JSON, CSV, Excel (.xlsx)
    Formatos de entrada aceptados: JSON, CSV, Excel (.xlsx/.xls/.xlsm), OpenDocument (.ods)
@@ -1782,7 +2399,7 @@ function csvEscape(v){
 }
 function exportCellValue(c, r){
   const v = r[c.key];
-  if(c.kind === "image") return v ? "Adjunta (ver en la app)" : "—";
+  if(c.kind === "image" || c.kind === "file") return v ? "Adjunta (ver en la app)" : "—";
   if(c.money) return Number(v) || 0;
   return v ?? "";
 }
@@ -2097,6 +2714,8 @@ function coerceValue(col, raw){
     }
   } else if(col.kind === "image"){
     v = (typeof v === "string" && v.startsWith("data:image")) ? v : "";
+  } else if(col.kind === "file"){
+    v = (typeof v === "string" && v.startsWith("data:")) ? v : "";
   } else {
     v = String(v).trim();
     if(col.uppercase) v = v.toUpperCase();
@@ -2109,7 +2728,7 @@ function coerceValue(col, raw){
    los campos importables (sin contar calculados ni fotos). */
 function moduleDedupeFields(cfg){
   if(cfg.dedupeFields) return cfg.dedupeFields;
-  return cfg.columns.filter(c => c.kind !== "computed" && c.kind !== "image").map(c => c.key);
+  return cfg.columns.filter(c => c.kind !== "computed" && c.kind !== "image" && c.kind !== "file").map(c => c.key);
 }
 function rowSignature(cfg, row){
   return moduleDedupeFields(cfg).map(k => normalizeHeader(row[k])).join("§");
@@ -2414,16 +3033,6 @@ function openImportModal(moduleKey){
   });
 }
 
-async function resetAll(){
-  if(!confirm("Esto borrará TODOS los datos guardados en la base de datos (registros, catálogos personalizados, papelera e historial). Esta acción no se puede deshacer. ¿Continuar?")) return;
-  const { error } = await apiFetch("storage/reset_all.php", { method: "POST" });
-  if(error){ console.error("Error al borrar los datos", error); toast("Error al borrar los datos"); return; }
-  _dirty = emptyDirty();
-  await loadDB();
-  goTo("dashboard");
-  toast("Todos los datos fueron borrados");
-}
-
 /* ==========================================================================
    LOGIN DE ADMINISTRADOR
    ========================================================================== */
@@ -2457,9 +3066,11 @@ async function startApp(admin){
   _appStarted = true;
   hideLoginScreen();
 
+  currentAdmin = admin || null;
   const email = admin?.email || "";
+  const rolLabel = admin?.rol === "admin" ? "Administrador" : "Operador/despachador";
   const sessionLabel = $("#adminSession");
-  if(sessionLabel) sessionLabel.textContent = email ? `Sesión: ${email}` : "";
+  if(sessionLabel) sessionLabel.textContent = email ? `Sesión: ${email} · ${rolLabel}` : "";
 
   await loadDB();
   // Antes esta sincronización solo corría dentro del listener realtime de
@@ -2473,10 +3084,13 @@ async function startApp(admin){
   ensureMobileTopbar();
   renderSidebar();
   renderMain();
-  $("#btnReset").addEventListener("click", resetAll);
+  initNotifBell();
+  loadNotifications();
+  setInterval(loadNotifications, 30000);
   $("#btnLogout").addEventListener("click", async () => {
     await apiFetch("logout.php", { method: "POST" });
     _appStarted = false;
+    currentAdmin = null;
     showLoginScreen();
   });
   watchRutasRealtime();

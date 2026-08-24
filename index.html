@@ -8,7 +8,7 @@
 <link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
 <link rel="icon" type="image/png" sizes="192x192" href="img/favicon-192.png">
 <link rel="apple-touch-icon" href="img/favicon-180.png">
-<link rel="stylesheet" href="css/style.css?v=12">
+<link rel="stylesheet" href="css/style.css?v=15">
 </head>
 <body>
 
@@ -62,12 +62,17 @@
         <b>Control Flota</b>
         <small>Gestión vehicular</small>
       </div>
+      <div class="notif-bell-wrap">
+        <button id="btnNotifBell" class="notif-bell" title="Notificaciones">
+          🔔<span class="notif-badge" id="notifBadge" hidden>0</span>
+        </button>
+        <div class="notif-panel" id="notifPanel" hidden></div>
+      </div>
     </div>
     <nav class="nav" id="nav"></nav>
     <div class="sidebar-foot">
       <div class="save-indicator" id="saveIndicator">✓ Guardado automáticamente</div>
       Todos los cambios se guardan solos en la base de datos del sistema.
-      <button id="btnReset">↺ Borrar todos los datos</button>
       <div class="admin-session" id="adminSession"></div>
       <button id="btnLogout">⎋ Cerrar sesión</button>
     </div>
@@ -119,6 +124,6 @@
 
 <script>document.getElementById('footerYear').textContent = new Date().getFullYear();</script>
 <script src="js/data.js"></script>
-<script src="js/app.js?v=11"></script>
+<script src="js/app.js?v=15"></script>
 </body>
 </html>

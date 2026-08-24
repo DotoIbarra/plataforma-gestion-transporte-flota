@@ -33,8 +33,22 @@ let flotaPlacas = [];    // [{value,label}]
 let estadosCat = ["Disponible","En viaje","En mantenimiento","No disponible"];
 let obrasCat = [];       // catálogo de obras (mismo que usa el panel admin)
 let rutas = [];
+let incidencias = [];
+let tiposIncidenciaCat = ["Accidente de tránsito","Falla mecánica","Retraso de entrega","Daño de carga","Problema con cliente","Robo o pérdida","Conducta del conductor","Otro"];
+let gravedadCat = ["Baja","Media","Alta","Crítica"];
+let currentTab = "rutas"; // "rutas" | "incidencias"
 let authBusy = false;
 let realtimeChannel = null; // ahora es un id de setInterval, no un canal de Supabase
+let ubicacionInterval = null; // id del setInterval que manda pings de GPS
+let avisoUbicacionMostrado = false; // para no repetir el toast de "sin permiso" cada vez
+
+// Flujo de estados del servicio: qué botón mostrarle al conductor según el
+// estado actual, y a qué estado avanza al tocarlo (ver api/conductor_rutas/estado.php).
+const SIGUIENTE_ESTADO = {
+  "Asignado":  { estado: "Aceptado",  label: "✅ Aceptar viaje" },
+  "Aceptado":  { estado: "En ruta",   label: "🚚 Iniciar ruta" },
+  "En ruta":   { estado: "En destino",label: "📍 Llegué a destino" },
+};
 
 /* ---------------------------------------------------------------- utils */
 const $  = (sel, root=document) => root.querySelector(sel);
@@ -207,14 +221,15 @@ async function loadProfileAndData(){
   // Ya no hace falta reparar/reintentar el enlace de la cuenta: el backend
   // (api/conductor_auth/login.php y register.php) siempre deja la ficha de
   // "conductores" enlazada de una, sin condiciones de carrera que reparar.
-  const [profileRes, refRes, rutasRes] = await Promise.all([
+  const [profileRes, refRes, rutasRes, incidenciasRes] = await Promise.all([
     apiFetch("conductor_auth/me.php"),
     apiFetch("conductor_data/reference.php"),
     apiFetch("conductor_rutas/list.php"),
+    apiFetch("conductor_incidencias/list.php"),
   ]);
 
   if(profileRes.error || !profileRes.data.logged_in){
-    profile = null; rutas = [];
+    profile = null; rutas = []; incidencias = [];
     renderAuth("login");
     return;
   }
@@ -227,11 +242,60 @@ async function loadProfileAndData(){
   // por el conductor quede con la misma Obra disponible ahí — sin esto,
   // "obra" quedaba vacío y el flete espejo en Fletes no se podía asociar.
   if(Array.isArray(ref.catalogos?.obras)) obrasCat = ref.catalogos.obras.slice().sort((a,b)=>a.localeCompare(b,"es"));
+  if(Array.isArray(ref.catalogos?.tiposIncidencia)) tiposIncidenciaCat = ref.catalogos.tiposIncidencia;
+  if(Array.isArray(ref.catalogos?.gravedadIncidencia)) gravedadCat = ref.catalogos.gravedadIncidencia;
 
   rutas = purgeClosedRoutes((rutasRes.data && rutasRes.data.rows) || []);
+  incidencias = (incidenciasRes.data && incidenciasRes.data.rows) || [];
 
   renderApp();
   watchRealtime();
+  actualizarSeguimientoUbicacion();
+}
+
+/* ==========================================================================
+   SEGUIMIENTO GPS (interino, vía navegador) — mientras la flota no tenga
+   GPS instalado en los vehículos, la ubicación se toma del teléfono con el
+   que el conductor usa esta app, y solo mientras tiene un servicio activo
+   (Aceptado / En ruta / En destino). No se pide ubicación en segundo plano
+   ni fuera de esos estados. El día que haya GPS embarcado, esto se puede
+   reemplazar o complementar sin tocar el resto del sistema (mismo endpoint,
+   misma tabla: ver api/conductor_rutas/ubicacion.php).
+   ========================================================================== */
+const ESTADOS_CON_SEGUIMIENTO = ["Aceptado","En ruta","En destino"];
+
+function pingUbicacion(nro){
+  if(!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      apiFetch("conductor_rutas/ubicacion.php", {
+        method: "POST",
+        body: { nro, lat: pos.coords.latitude, lng: pos.coords.longitude, precision: Math.round(pos.coords.accuracy || 0) },
+      }).catch(()=>{});
+    },
+    () => {
+      if(!avisoUbicacionMostrado){
+        avisoUbicacionMostrado = true;
+        toast("Activa la ubicación del teléfono para que la empresa pueda ver tu recorrido en el mapa");
+      }
+    },
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 }
+  );
+}
+
+// Manda un ping ahora mismo y arranca (o detiene) el envío periódico según
+// si el conductor tiene algún servicio en curso. Se llama tras cargar los
+// datos y cada vez que cambia el estado de una ruta.
+function actualizarSeguimientoUbicacion(){
+  const activas = rutas.filter(r => ESTADOS_CON_SEGUIMIENTO.includes(r.estadoServicio));
+  activas.forEach(r => pingUbicacion(r.nro));
+
+  if(ubicacionInterval){ clearInterval(ubicacionInterval); ubicacionInterval = null; }
+  if(activas.length){
+    ubicacionInterval = setInterval(() => {
+      rutas.filter(r => ESTADOS_CON_SEGUIMIENTO.includes(r.estadoServicio)).forEach(r => pingUbicacion(r.nro));
+    }, 120000); // cada 2 minutos, para no drenar la batería del teléfono
+  }
 }
 
 function watchRealtime(){
@@ -242,10 +306,15 @@ function watchRealtime(){
   // inmediato.
   if(realtimeChannel) clearInterval(realtimeChannel);
   realtimeChannel = setInterval(async () => {
-    const { data, error } = await apiFetch("conductor_rutas/list.php");
-    if(error) return;
-    rutas = purgeClosedRoutes(data.rows || []);
-    if($("#routeList")) renderRouteList();
+    const [rutasRes, incidenciasRes] = await Promise.all([
+      apiFetch("conductor_rutas/list.php"),
+      apiFetch("conductor_incidencias/list.php"),
+    ]);
+    if(!rutasRes.error) rutas = purgeClosedRoutes(rutasRes.data.rows || []);
+    if(!incidenciasRes.error) incidencias = incidenciasRes.data.rows || [];
+    if(currentTab === "rutas" && $("#routeList")) renderRouteList();
+    if(currentTab === "incidencias" && $("#incidentList")) renderIncidentList();
+    actualizarSeguimientoUbicacion();
   }, 30000);
 }
 
@@ -263,9 +332,12 @@ function purgeClosedRoutes(list){
    ========================================================================== */
 function computeIngreso(r){ return (Number(r.pesoCarga)||0) * (Number(r.costoPorKg)||0); }
 
-// Una ruta queda "cerrada" en cuanto tiene foto de report (fotoFin) guardada.
+// Una ruta queda "cerrada" en cuanto tiene foto de report (fotoFin) guardada,
+// o su estado de servicio ya llegó a un estado terminal (Finalizado/Cancelado).
 // A partir de ahí ya no se puede editar ni eliminar desde la app.
-function isRouteClosed(r){ return !!(r && r.fotoFin); }
+function isRouteClosed(r){
+  return !!(r && (r.fotoFin || r.estadoServicio === "Finalizado" || r.estadoServicio === "Cancelado"));
+}
 
 function estadoBadgeClass(estado){
   if(estado === "En viaje") return "badge-accent";
@@ -273,37 +345,72 @@ function estadoBadgeClass(estado){
   return "badge-neutral";
 }
 
+// Badge para el ESTADO DEL SERVICIO (asignado→...→finalizado), distinto del
+// estado del vehículo (estadoBadgeClass, más arriba).
+function servicioBadgeClass(estado){
+  if(estado === "En ruta") return "badge-accent";
+  if(estado === "En destino" || estado === "Aceptado") return "badge-ok";
+  if(estado === "Cancelado") return "badge-danger";
+  return "badge-neutral";
+}
+
+function gravedadBadgeClass(gravedad){
+  if(gravedad === "Alta" || gravedad === "Crítica") return "badge-danger";
+  if(gravedad === "Media") return "badge-accent";
+  return "badge-neutral";
+}
+
 function renderApp(){
   const nombreCompleto = profile ? `${profile.nombres||""} ${profile.apellidos||""}`.trim() : "Conductor";
   $("#app").innerHTML = `
     <div class="topbar">
-      <div class="who"><b>${esc(nombreCompleto || "Conductor")}</b><small>Mis rutas de viaje</small></div>
+      <div class="who"><b>${esc(nombreCompleto || "Conductor")}</b><small>${currentTab === "rutas" ? "Mis rutas de viaje" : "Mis incidencias reportadas"}</small></div>
       <button id="btnLogout">Salir</button>
     </div>
-    <div class="list-wrap" id="routeList"></div>
+    <div class="tabbar">
+      <div class="auth-tabs">
+        <button class="auth-tab ${currentTab==='rutas'?'active':''}" data-tab="rutas">🗺️ Rutas</button>
+        <button class="auth-tab ${currentTab==='incidencias'?'active':''}" data-tab="incidencias">⚠️ Incidencias</button>
+      </div>
+    </div>
+    <div class="list-wrap" id="routeList" style="${currentTab==='rutas'?'':'display:none'}"></div>
+    <div class="list-wrap" id="incidentList" style="${currentTab==='incidencias'?'':'display:none'}"></div>
+    ${currentTab==='incidencias' ? `<button class="fab" id="btnFab" title="Reportar incidencia">+</button>` : ``}
   `;
   renderRouteList();
+  renderIncidentList();
   $("#btnLogout").addEventListener("click", async () => {
     await apiFetch("conductor_auth/logout.php", { method: "POST" });
     if(realtimeChannel){ clearInterval(realtimeChannel); realtimeChannel = null; }
-    profile = null; rutas = [];
+    profile = null; rutas = []; incidencias = [];
     renderAuth("login");
   });
+  $$('[data-tab]', $(".tabbar")).forEach(b => b.addEventListener('click', () => {
+    currentTab = b.dataset.tab;
+    renderApp();
+  }));
+  // El FAB (+) solo existe en la pestaña de Incidencias: crear rutas es
+  // exclusivo del panel admin (el conductor solo ve y avanza las que ya
+  // le asignaron), así que en la pestaña "Rutas" no se muestra el botón.
+  const btnFab = $("#btnFab");
+  if(btnFab) btnFab.addEventListener("click", () => openIncidentForm());
 }
 
 function renderRouteList(){
   const wrap = $("#routeList");
   if(!wrap) return;
   if(!rutas.length){
-    wrap.innerHTML = `<div class="list-empty"><span class="ico">🗺️</span>Todavía no tienes rutas registradas.<br>Toca el botón <b>+</b> para crear la primera.</div>`;
+    wrap.innerHTML = `<div class="list-empty"><span class="ico">🗺️</span>Todavía no tienes rutas asignadas.<br>Cuando el equipo de operaciones te asigne un servicio, va a aparecer acá.</div>`;
     return;
   }
   wrap.innerHTML = rutas.map(r => {
+    const estadoServicio = r.estadoServicio || "Asignado";
+    const siguiente = SIGUIENTE_ESTADO[estadoServicio];
     return `
     <div class="route-card">
       <div class="rc-top">
         <div class="rc-route">${esc(r.origen||"—")}<span class="arrow">→</span>${esc(r.destino||"—")}</div>
-        ${r.estado ? `<span class="badge ${estadoBadgeClass(r.estado)}">${esc(r.estado)}</span>` : ``}
+        <span class="badge ${servicioBadgeClass(estadoServicio)}">${esc(estadoServicio)}</span>
       </div>
       <div class="rc-meta">
         <span>📅 <b>${fmtDate(r.fechaSalida)}</b>${r.fechaLlegada ? ` → ${fmtDate(r.fechaLlegada)}` : ``}</span>
@@ -311,11 +418,148 @@ function renderRouteList(){
         ${(r.pesoCarga || r.costoPorKg) ? `<span>💵 <b>$${fmtMoney(computeIngreso(r))}</b></span>` : ``}
       </div>
       <div class="rc-actions">
-        <button data-edit="${r.nro}">✎ Editar</button>
+        ${siguiente ? `<button data-avanzar="${r.nro}" data-estado="${siguiente.estado}">${siguiente.label}</button>` : ``}
+        ${estadoServicio === "En destino" ? `<button data-edit="${r.nro}">📷 Cerrar con Report</button>` : `<button data-edit="${r.nro}">✎ Editar</button>`}
       </div>
     </div>`;
   }).join("");
   $$('[data-edit]', wrap).forEach(b => b.addEventListener('click', () => openRouteForm(rutas.find(r => String(r.nro) === b.dataset.edit))));
+  $$('[data-avanzar]', wrap).forEach(b => b.addEventListener('click', () => cambiarEstadoServicio(Number(b.dataset.avanzar), b.dataset.estado)));
+}
+
+// Avanza el estado de un servicio (o lo cancela) usando el endpoint dedicado
+// que solo toca esa columna — así nunca se pisa el resto de la ruta.
+async function cambiarEstadoServicio(nro, estadoServicio){
+  const { data, error } = await apiFetch("conductor_rutas/estado.php", { method: "POST", body: { nro, estadoServicio } });
+  if(error){ toast(error); return; }
+  const idx = rutas.findIndex(r => r.nro === nro);
+  if(idx !== -1) rutas[idx].estadoServicio = data.estadoServicio;
+  if(estadoServicio === "Cancelado") rutas = purgeClosedRoutes(rutas);
+  toast(estadoServicio === "Cancelado" ? "Servicio cancelado" : `Estado actualizado: ${estadoServicio}`);
+  renderRouteList();
+  actualizarSeguimientoUbicacion(); // manda un ping ya mismo con la posición actual y ajusta el intervalo
+}
+
+/* ==========================================================================
+   INCIDENCIAS
+   ========================================================================== */
+function renderIncidentList(){
+  const wrap = $("#incidentList");
+  if(!wrap) return;
+  if(!incidencias.length){
+    wrap.innerHTML = `<div class="list-empty"><span class="ico">⚠️</span>No has reportado incidencias.<br>Toca el botón <b>+</b> para reportar una.</div>`;
+    return;
+  }
+  wrap.innerHTML = incidencias.map(i => `
+    <div class="route-card">
+      <div class="rc-top">
+        <div class="rc-route">${esc(i.tipo||"Incidencia")}</div>
+        <span class="badge ${gravedadBadgeClass(i.gravedad)}">${esc(i.gravedad||"—")}</span>
+      </div>
+      <div class="rc-meta">
+        <span>📅 <b>${fmtDate(i.fecha)}</b></span>
+        ${i.placa ? `<span>🚚 <b>${esc(i.placa)}</b></span>` : ``}
+        <span>🔖 <b>${esc(i.estado||"Abierta")}</b></span>
+      </div>
+      <div class="rc-meta" style="margin-top:-4px"><span>${esc(i.descripcion||"")}</span></div>
+      ${i.solucion ? `<div class="rc-meta"><span>✔ Solución: ${esc(i.solucion)}</span></div>` : ``}
+    </div>`).join("");
+}
+
+function openIncidentForm(){
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.id = "overlay";
+  const imageDraft = { evidencia: "" };
+  overlay.innerHTML = `
+    <div class="sheet">
+      <div class="sheet-head">
+        <h3>Reportar incidencia</h3>
+        <button class="sheet-close" id="sheetClose">✕</button>
+      </div>
+      <form id="incidentForm">
+        <div class="field">
+          <label>Tipo de incidencia *</label>
+          <select id="iTipo" required>
+            <option value="">— Seleccionar —</option>
+            ${tiposIncidenciaCat.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>Gravedad *</label>
+          <select id="iGravedad" required>
+            ${gravedadCat.map(g => `<option value="${esc(g)}" ${g==='Media'?'selected':''}>${esc(g)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>Ruta relacionada (opcional)</label>
+          <select id="iRuta">
+            <option value="">— Ninguna —</option>
+            ${rutas.map(r => `<option value="${r.nro}">${esc(r.origen||"—")} → ${esc(r.destino||"—")} (${fmtDate(r.fechaSalida)})</option>`).join("")}
+          </select>
+        </div>
+        <div class="field"><label>Placa (opcional)</label>
+          <select id="iPlaca">
+            <option value="">— Ninguna —</option>
+            ${flotaPlacas.map(p => `<option value="${esc(p.value)}">${esc(p.label)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field"><label>Descripción *</label><textarea id="iDescripcion" maxlength="2000" rows="4" required placeholder="Qué pasó, cuándo y dónde"></textarea></div>
+        <div class="image-field" data-image-field="evidencia">
+          <label>Foto de evidencia (opcional)</label>
+          <div class="image-preview-box"><span class="image-placeholder">📷 Sin foto</span></div>
+          <div class="image-actions">
+            <button type="button" class="btn-sm" data-image-pick-camera="evidencia">📷 Tomar foto</button>
+            <button type="button" class="btn-sm" data-image-pick-gallery="evidencia">🖼️ Galería</button>
+          </div>
+          <input type="file" accept="image/*" capture="environment" id="file-camera-evidencia" hidden>
+          <input type="file" accept="image/*" id="file-gallery-evidencia" hidden>
+        </div>
+        <button type="submit" class="btn btn-accent" id="incidentSubmit">Enviar reporte</button>
+      </form>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const closeSheet = () => overlay.remove();
+  $("#sheetClose", overlay).addEventListener("click", closeSheet);
+  overlay.addEventListener("click", e => { if(e.target.id === "overlay") closeSheet(); });
+
+  const handlePicked = async e => {
+    const file = e.target.files[0];
+    if(!file) return;
+    try{
+      imageDraft.evidencia = await fileToCompressedDataURL(file);
+      rerenderImageField(overlay, "evidencia", imageDraft);
+    }catch(err){ toast(err.message || "No se pudo procesar la imagen"); }
+  };
+  $(`[data-image-pick-camera="evidencia"]`, overlay).addEventListener("click", () => $(`#file-camera-evidencia`, overlay).click());
+  $(`[data-image-pick-gallery="evidencia"]`, overlay).addEventListener("click", () => $(`#file-gallery-evidencia`, overlay).click());
+  $(`#file-camera-evidencia`, overlay).addEventListener("change", handlePicked);
+  $(`#file-gallery-evidencia`, overlay).addEventListener("change", handlePicked);
+
+  $("#incidentForm", overlay).addEventListener("submit", async e => {
+    e.preventDefault();
+    const tipo = $("#iTipo", overlay).value;
+    const descripcion = $("#iDescripcion", overlay).value.trim();
+    if(!tipo || !descripcion){ toast("Falta el tipo o la descripción"); return; }
+    const payload = {
+      tipo,
+      gravedad: $("#iGravedad", overlay).value,
+      rutaNro: $("#iRuta", overlay).value || null,
+      placa: $("#iPlaca", overlay).value || "",
+      descripcion,
+      evidencia: imageDraft.evidencia || "",
+    };
+    const btn = $("#incidentSubmit", overlay);
+    btn.disabled = true;
+    const { data, error } = await apiFetch("conductor_incidencias/save.php", { method: "POST", body: payload });
+    btn.disabled = false;
+    if(error){ toast("No se pudo enviar el reporte"); return; }
+    incidencias.unshift(data.row);
+    overlay.remove();
+    toast("Incidencia reportada");
+    renderIncidentList();
+  });
 }
 
 /* ---------------------------------------------------------------- formulario de ruta */
@@ -451,6 +695,10 @@ async function submitRoute(existing, imageDraft, overlay){
     fechaLlegada: $("#fFechaLlegada", overlay).value || null,
     placa,
     estado: $("#fEstado", overlay).value || "",
+    // Al editar, se conserva el estado del servicio actual (los cambios de
+    // estado se hacen con los botones de la tarjeta, no desde este formulario).
+    // Al crear una ruta nueva, se omite y el servidor la deja en "Asignado".
+    estadoServicio: existing ? existing.estadoServicio : undefined,
     conductor: nombreCompleto, // el servidor lo vuelve a completar solo de todos modos, con el nombre real de la cuenta
     obra,
     origen: $("#fOrigen", overlay).value.trim(),

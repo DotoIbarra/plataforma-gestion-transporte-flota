@@ -5,10 +5,10 @@ require_admin();
 
 const TABLE = 'rutas';
 const COLUMNS = [
-    'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'conductor',
+    'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'estadoServicio', 'conductor',
     'origen', 'destino', 'fotoInicio', 'fotoFin', 'pesoCarga', 'costoPorKg',
     'observaciones', 'obra', 'solicitadoPor', 'nroRepor', 'nroGuia',
-    'conductor_user_id',
+    'conductor_user_id', 'lat', 'lng', 'ubicacionTs',
 ];
 
 json_response(['rows' => list_rows(TABLE, COLUMNS)]);

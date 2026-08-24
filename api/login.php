@@ -14,7 +14,7 @@ if ($email === '' || $password === '') {
     json_error('Correo y contraseña son obligatorios', 422);
 }
 
-$stmt = db()->prepare('SELECT id, email, password_hash, nombre FROM admin_users WHERE email = ? LIMIT 1');
+$stmt = db()->prepare('SELECT id, email, password_hash, nombre, rol FROM admin_users WHERE email = ? LIMIT 1');
 $stmt->bind_param('s', $email);
 $stmt->execute();
 $result = $stmt->get_result();
@@ -31,6 +31,8 @@ if (!$admin || !password_verify($password, $admin['password_hash'])) {
 session_regenerate_id(true);
 $_SESSION['admin_id'] = $admin['id'];
 $_SESSION['admin_email'] = $admin['email'];
+$_SESSION['admin_rol'] = $admin['rol'] ?: 'admin';
+$_SESSION['admin_nombre'] = $admin['nombre'] ?: $admin['email'];
 
 json_response([
     'ok' => true,
@@ -38,5 +40,6 @@ json_response([
         'id' => $admin['id'],
         'email' => $admin['email'],
         'nombre' => $admin['nombre'],
+        'rol' => $admin['rol'] ?: 'admin',
     ],
 ]);
