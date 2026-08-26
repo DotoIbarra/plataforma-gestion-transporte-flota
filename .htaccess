@@ -49,3 +49,28 @@ RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
    php_flag zlib.output_compression Off
 </IfModule>
 # END cPanel-generated php ini directives, do not edit
+
+# ============================================================
+# Rendimiento: compresión y caché de archivos estáticos
+# (agregado a mano — no toca los bloques generados por cPanel de arriba)
+# ============================================================
+
+# Comprime HTML/CSS/JS/JSON antes de enviarlos: reduce bastante el peso
+# transferido de css/style.css y js/app.js (hoy ~35 KB y ~160 KB sin
+# comprimir).
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/css text/javascript application/javascript application/json
+</IfModule>
+
+# Le dice al navegador que puede reusar imágenes/CSS/JS de la caché local
+# en vez de pedirlos de nuevo en cada visita. Los archivos con "?v=17" en
+# la URL se refrescan solos cuando subes una versión nueva (basta con subir
+# ese número en index.html).
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType text/css "access plus 1 month"
+  ExpiresByType application/javascript "access plus 1 month"
+  ExpiresByType image/png "access plus 1 year"
+  ExpiresByType image/jpeg "access plus 1 year"
+  ExpiresByType image/webp "access plus 1 year"
+</IfModule>

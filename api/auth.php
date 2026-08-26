@@ -37,21 +37,43 @@ function require_admin(): void {
     }
 }
 
-/** Rol del admin actualmente logueado ('admin' | 'operador'), o null si no hay sesión. */
+/** Rol del admin actualmente logueado ('superadmin' | 'admin' | 'operador'), o null si no hay sesión. */
 function current_admin_rol(): ?string {
     start_secure_session();
     return $_SESSION['admin_rol'] ?? null;
 }
 
+/** True si el admin logueado es específicamente el Super Usuario (el programador). */
+function is_superadmin(): bool {
+    return current_admin_rol() === 'superadmin';
+}
+
 /**
- * Corta la ejecución con 403 si el admin logueado no tiene rol "admin".
- * Se usa en endpoints reservados solo para administradores (gestión de
- * usuarios, restaurar respaldo completo), no para operadores/despachadores.
+ * Corta la ejecución con 403 si el admin logueado no tiene rol "admin" o
+ * "superadmin". Se usa en endpoints reservados para administración general
+ * (gestión de usuarios, catálogos sensibles, etc.), no para
+ * operadores/despachadores. El Super Usuario siempre pasa este chequeo,
+ * porque tiene todos los permisos de un Administrador y más.
  * Siempre llamar DESPUÉS de require_admin() (exige sesión antes que rol).
  */
 function require_role_admin(): void {
     require_admin();
-    if (current_admin_rol() !== 'admin') {
+    $rol = current_admin_rol();
+    if ($rol !== 'admin' && $rol !== 'superadmin') {
         json_error('No tienes permisos de administrador para esta acción', 403);
+    }
+}
+
+/**
+ * Corta la ejecución con 403 si el admin logueado no es el Super Usuario.
+ * Reservado para lo más delicado del sistema: acciones destructivas
+ * irreversibles (borrar todo y reiniciar) y la gestión de cuentas con rol
+ * "admin" o "superadmin" (ni un Administrador puede tocar esas cuentas).
+ * Siempre llamar DESPUÉS de require_admin().
+ */
+function require_role_superadmin(): void {
+    require_admin();
+    if (!is_superadmin()) {
+        json_error('Esta acción está reservada para el Super Usuario', 403);
     }
 }

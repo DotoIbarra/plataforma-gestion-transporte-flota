@@ -8,7 +8,7 @@
 <link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
 <link rel="icon" type="image/png" sizes="192x192" href="img/favicon-192.png">
 <link rel="apple-touch-icon" href="img/favicon-180.png">
-<link rel="stylesheet" href="css/style.css?v=15">
+<link rel="stylesheet" href="css/style.css?v=18">
 </head>
 <body>
 
@@ -119,11 +119,11 @@
 <!-- xlsx-js-style: mismo motor que SheetJS Community (0.18.5) más soporte para
      ESCRIBIR estilos de celda (negrita, colores, bordes) en el Excel exportado.
      La SheetJS gratuita estándar solo permite leer estilos, no escribirlos. -->
-<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js" defer></script>
 
 
 <script>document.getElementById('footerYear').textContent = new Date().getFullYear();</script>
-<script src="js/data.js"></script>
-<script src="js/app.js?v=15"></script>
+<script src="js/data.js" defer></script>
+<script src="js/app.js?v=18" defer></script>
 </body>
 </html>

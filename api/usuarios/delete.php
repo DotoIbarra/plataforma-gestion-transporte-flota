@@ -28,6 +28,21 @@ if (!$target) {
     json_error('Usuario no encontrado', 404);
 }
 
+// Cuentas "superadmin" o "admin" solo las puede borrar el Super Usuario.
+if (($target['rol'] === 'superadmin' || $target['rol'] === 'admin') && !is_superadmin()) {
+    json_error('Solo el Super Usuario puede eliminar esa cuenta', 403);
+}
+
+if ($target['rol'] === 'superadmin') {
+    $stmt = $conn->prepare("SELECT COUNT(*) AS total FROM admin_users WHERE rol = 'superadmin'");
+    $stmt->execute();
+    $totalSuper = (int)($stmt->get_result()->fetch_assoc()['total'] ?? 0);
+    $stmt->close();
+    if ($totalSuper <= 1) {
+        json_error('No puedes eliminar al único Super Usuario', 422);
+    }
+}
+
 if ($target['rol'] === 'admin') {
     $stmt = $conn->prepare("SELECT COUNT(*) AS total FROM admin_users WHERE rol = 'admin'");
     $stmt->execute();

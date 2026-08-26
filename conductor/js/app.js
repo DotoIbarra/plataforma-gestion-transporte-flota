@@ -419,7 +419,7 @@ function renderRouteList(){
       </div>
       <div class="rc-actions">
         ${siguiente ? `<button data-avanzar="${r.nro}" data-estado="${siguiente.estado}">${siguiente.label}</button>` : ``}
-        ${estadoServicio === "En destino" ? `<button data-edit="${r.nro}">📷 Cerrar con Report</button>` : `<button data-edit="${r.nro}">✎ Editar</button>`}
+        ${estadoServicio === "En destino" ? `<button data-edit="${r.nro}">📷 Cerrar con Report</button>` : `<button data-edit="${r.nro}">📷 Ver / subir fotos</button>`}
       </div>
     </div>`;
   }).join("");
@@ -563,11 +563,20 @@ function openIncidentForm(){
 }
 
 /* ---------------------------------------------------------------- formulario de ruta */
+// IMPORTANTE: el conductor NUNCA crea ni edita los datos de una ruta —
+// esta pantalla solo existe para rutas ya asignadas por el panel de admin.
+// Todos los campos se muestran de solo lectura (field-static); lo único
+// interactivo son las dos fotos y, por separado, los botones de avanzar
+// estado en la tarjeta. El servidor (api/conductor_rutas/save.php) refuerza
+// esto mismo del lado del backend, así que esta pantalla no es la única
+// defensa: aunque alguien manipule el HTML, el servidor igual rechaza
+// cualquier campo que no sea fotoInicio/fotoFin.
 function openRouteForm(existing){
-  if(existing && isRouteClosed(existing)){ toast("Esta ruta ya está cerrada y no se puede editar."); return; }
-  const isEdit = !!existing;
-  const draft = existing ? { ...existing } : { fechaSalida: todayISO(), estado: estadosCat[0] || "" };
+  if(!existing) return; // crear rutas es exclusivo del panel de admin
+  if(isRouteClosed(existing)){ toast("Esta ruta ya está cerrada y no se puede modificar."); return; }
+  const draft = { ...existing };
   const imageDraft = { fotoInicio: draft.fotoInicio || "", fotoFin: draft.fotoFin || "" };
+  const readOnly = (label, value) => `<div class="field"><label>${esc(label)}</label><div class="field-static">${value ? esc(value) : "—"}</div></div>`;
 
   const overlay = document.createElement("div");
   overlay.className = "overlay";
@@ -575,38 +584,22 @@ function openRouteForm(existing){
   overlay.innerHTML = `
     <div class="sheet">
       <div class="sheet-head">
-        <h3>${isEdit ? "Editar ruta" : "Nueva ruta"}</h3>
+        <h3>Detalle de la ruta</h3>
         <button class="sheet-close" id="sheetClose">✕</button>
       </div>
       <form id="routeForm">
+        <p class="hint" style="margin:-4px 0 14px;">Estos datos los define el equipo de operaciones desde el panel de administración. Aquí solo puedes subir las fotos.</p>
         <div class="field"><label>Conductor</label><div class="field-static">${esc(`${profile?.nombres||""} ${profile?.apellidos||""}`.trim() || "Yo")}</div></div>
         <div class="field-row">
-          <div class="field"><label>Fecha salida *</label><input type="date" id="fFechaSalida" value="${esc(draft.fechaSalida||"")}" required></div>
-          <div class="field"><label>Fecha llegada</label><input type="date" id="fFechaLlegada" value="${esc(draft.fechaLlegada||"")}"></div>
+          ${readOnly("Fecha salida", fmtDate(draft.fechaSalida))}
+          ${readOnly("Fecha llegada", draft.fechaLlegada ? fmtDate(draft.fechaLlegada) : "")}
         </div>
-        <div class="field">
-          <label>Placa *</label>
-          <select id="fPlaca" required>
-            <option value="">— Seleccionar —</option>
-            ${flotaPlacas.map(p => `<option value="${esc(p.value)}" ${draft.placa===p.value?"selected":""}>${esc(p.label)}</option>`).join("")}
-          </select>
-        </div>
-        <div class="field">
-          <label>Estado del vehículo</label>
-          <select id="fEstado">
-            ${estadosCat.map(e => `<option value="${esc(e)}" ${draft.estado===e?"selected":""}>${esc(e)}</option>`).join("")}
-          </select>
-        </div>
-        <div class="field">
-          <label>Obra *</label>
-          <select id="fObra" required>
-            <option value="">— Seleccionar —</option>
-            ${obrasCat.map(o => `<option value="${esc(o)}" ${draft.obra===o?"selected":""}>${esc(o)}</option>`).join("")}
-          </select>
-        </div>
+        ${readOnly("Placa", draft.placa)}
+        ${readOnly("Estado del vehículo", draft.estado)}
+        ${readOnly("Obra", draft.obra)}
         <div class="field-row">
-          <div class="field"><label>Origen</label><input type="text" id="fOrigen" maxlength="200" value="${esc(draft.origen||"")}"></div>
-          <div class="field"><label>Destino</label><input type="text" id="fDestino" maxlength="200" value="${esc(draft.destino||"")}"></div>
+          ${readOnly("Origen", draft.origen)}
+          ${readOnly("Destino", draft.destino)}
         </div>
         <div class="image-field" data-image-field="fotoInicio">
           <label>Foto de inicio de ruta</label>
@@ -627,16 +620,13 @@ function openRouteForm(existing){
             <button type="button" class="btn-sm" data-image-pick-gallery="fotoFin">🖼️ Galería</button>
             ${imageDraft.fotoFin ? `<button type="button" class="btn-sm danger" data-image-remove="fotoFin">Quitar</button>` : ``}
           </div>
-          <small class="hint">Al guardar con esta foto, la ruta queda cerrada y ya no se podrá editar ni eliminar.</small>
+          <small class="hint">Al guardar con esta foto, la ruta queda cerrada y ya no se podrá modificar.</small>
           <input type="file" accept="image/*" capture="environment" id="file-camera-fotoFin" hidden>
           <input type="file" accept="image/*" id="file-gallery-fotoFin" hidden>
         </div>
-        <div class="field-row">
-          <div class="field"><label>Peso carga (Kg)</label><input type="number" step="any" id="fPeso" value="${draft.pesoCarga ?? ""}"></div>
-          <div class="field"><label>Costo x Kg ($)</label><input type="number" step="any" id="fCosto" value="${draft.costoPorKg ?? ""}"></div>
-        </div>
-        <div class="field"><label>Observaciones</label><textarea id="fObs" maxlength="2000" rows="3">${esc(draft.observaciones||"")}</textarea></div>
-        <button type="submit" class="btn btn-accent" id="routeSubmit">${isEdit ? "Guardar cambios" : "Crear ruta"}</button>
+        ${readOnly("Peso carga (Kg)", draft.pesoCarga != null && draft.pesoCarga !== "" ? draft.pesoCarga : "")}
+        ${readOnly("Observaciones", draft.observaciones)}
+        <button type="submit" class="btn btn-accent" id="routeSubmit">Guardar fotos</button>
       </form>
     </div>`;
   document.body.appendChild(overlay);
@@ -683,51 +673,24 @@ function rerenderImageField(overlay, key, imageDraft){
 }
 
 async function submitRoute(existing, imageDraft, overlay){
-  const nombreCompleto = `${profile?.nombres||""} ${profile?.apellidos||""}`.trim();
-  const placa = $("#fPlaca", overlay).value;
-  const fechaSalida = $("#fFechaSalida", overlay).value;
-  const obra = $("#fObra", overlay).value;
-  if(!placa || !fechaSalida || !obra){ toast("Falta completar Placa, Fecha salida u Obra"); return; }
-
+  // Solo se manda el nro y las dos fotos: es lo único que el conductor
+  // puede tocar. El servidor ignora (y de hecho ni siquiera lee) cualquier
+  // otro campo, así que ni vale la pena mandarlo.
   const payload = {
-    nro: existing ? existing.nro : undefined,
-    fechaSalida,
-    fechaLlegada: $("#fFechaLlegada", overlay).value || null,
-    placa,
-    estado: $("#fEstado", overlay).value || "",
-    // Al editar, se conserva el estado del servicio actual (los cambios de
-    // estado se hacen con los botones de la tarjeta, no desde este formulario).
-    // Al crear una ruta nueva, se omite y el servidor la deja en "Asignado".
-    estadoServicio: existing ? existing.estadoServicio : undefined,
-    conductor: nombreCompleto, // el servidor lo vuelve a completar solo de todos modos, con el nombre real de la cuenta
-    obra,
-    origen: $("#fOrigen", overlay).value.trim(),
-    destino: $("#fDestino", overlay).value.trim(),
+    nro: existing.nro,
     fotoInicio: imageDraft.fotoInicio || "",
     fotoFin: imageDraft.fotoFin || "",
-    pesoCarga: $("#fPeso", overlay).value === "" ? null : Number($("#fPeso", overlay).value),
-    costoPorKg: $("#fCosto", overlay).value === "" ? null : Number($("#fCosto", overlay).value),
-    observaciones: $("#fObs", overlay).value.trim(),
   };
 
   const btn = $("#routeSubmit", overlay);
   btn.disabled = true;
-
-  // api/conductor_rutas/save.php hace de una tanto la creación como la
-  // edición (según venga o no "nro" en el payload), y siempre revisa que la
-  // ruta editada sea realmente del conductor logueado antes de tocarla.
   const { data, error } = await apiFetch("conductor_rutas/save.php", { method: "POST", body: payload });
   btn.disabled = false;
-  if(error){ console.error(error); toast(existing ? "No se pudo guardar la ruta" : "No se pudo crear la ruta"); return; }
+  if(error){ console.error(error); toast("No se pudieron guardar las fotos"); return; }
 
-  if(existing){
-    const idx = rutas.findIndex(r => r.nro === existing.nro);
-    if(idx !== -1) rutas[idx] = data.row;
-    toast("Ruta actualizada");
-  } else {
-    rutas.unshift(data.row);
-    toast("Ruta creada");
-  }
+  const idx = rutas.findIndex(r => r.nro === existing.nro);
+  if(idx !== -1) rutas[idx] = data.row;
+  toast("Fotos guardadas");
   overlay.remove();
   renderRouteList();
 }

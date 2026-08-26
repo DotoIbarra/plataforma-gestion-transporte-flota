@@ -46,9 +46,14 @@ let TRASH = null;
 let LOG = null;
 let currentModule = "dashboard";
 let editing = { module: null, nro: null };
-let currentAdmin = null;     // {id,email,nombre,rol} — rol: "admin" | "operador"
+let currentAdmin = null;     // {id,email,nombre,rol} — rol: "superadmin" | "admin" | "operador"
 let notifState = { rows: [], noLeidas: 0 };
-const isFullAdmin = () => currentAdmin?.rol === "admin";
+// "Full admin" = puede ver Usuarios y roles, catálogos sensibles, etc.
+// Incluye tanto al Administrador como al Super Usuario.
+const isFullAdmin = () => currentAdmin?.rol === "admin" || currentAdmin?.rol === "superadmin";
+// El Super Usuario es el desarrollador/dueño del sistema: único rol que
+// puede tocar cuentas admin/superadmin y ejecutar el borrado total.
+const isSuperAdmin = () => currentAdmin?.rol === "superadmin";
 
 /* ---------------------------------------------------------------- utils */
 const $  = (sel, root=document) => root.querySelector(sel);
@@ -619,9 +624,11 @@ const MODULES = {
     ],
     computeFn: computeRuta,
     summary: r => `${r.origen} → ${r.destino}`,
-    // Una ruta con foto Report ya fue marcada como Realizada: queda
-    // bloqueada para edición y eliminación (su información ya vive en Fletes).
-    isLocked: r => !!r.fotoFin,
+    // Antes, una ruta con foto Report quedaba bloqueada para editar/eliminar
+    // desde el panel. Ahora el admin (o superadmin) siempre puede corregir o
+    // borrar una ruta, sea cual sea su estado — el bloqueo que sí sigue
+    // existiendo es del lado de la app del conductor (api/conductor_rutas),
+    // que nunca puede tocar estos campos.
   },
 
   multas: {
@@ -778,8 +785,25 @@ function renderSidebar(){
 
 function goTo(key){
   currentModule = key;
+  // El buscador y los filtros solo se reinician al navegar de verdad a un
+  // módulo (clic en el menú) — no en cada repintado por sondeo, ver
+  // refreshModuleData() más abajo.
+  searchTerm = "";
+  activeFilters = {};
   renderSidebar();
   renderMain();
+}
+
+/* Usada por el sondeo periódico (watchRutasRealtime) para refrescar los
+   datos en pantalla SIN reconstruir el buscador ni los <select> de
+   filtro — evita que el buscador/filtros del usuario se "reinicien solos"
+   cada 30s mientras el módulo sigue abierto. Si el módulo activo no
+   soporta repintado parcial (por ejemplo, todavía no se abrió ninguno vía
+   renderModule), cae a un render completo como respaldo. */
+function refreshModuleData(){
+  if(currentModule === "dashboard") return renderDashboard();
+  if(moduleRepaint && moduleRepaint.key === currentModule) return moduleRepaint.paint();
+  return renderMain();
 }
 
 /* ==========================================================================
@@ -1213,6 +1237,12 @@ function openExportFacturasModal(rows, total){
 /* ---------------------------------------------------------------- TABLA GENÉRICA POR MÓDULO */
 let searchTerm = "";
 let activeFilters = {};
+// Guarda una referencia al paint() del módulo genérico actualmente abierto
+// (y a qué módulo pertenece), para que el sondeo periódico de rutas pueda
+// refrescar solo los datos de la tabla sin reconstruir el buscador ni los
+// <select> de filtro — eso es justo lo que hacía que los filtros se
+// "reiniciaran solos" cada 30 segundos mientras se estaba usando el panel.
+let moduleRepaint = null;
 
 function sortFilterValues(key, items){
   // items: [{value, label}], donde "value" es la clave normalizada (recortada
@@ -1247,8 +1277,6 @@ function uniqueFilterValues(rows, key){
    repinta la tabla y el contador, vía paintModuleTable(). */
 function renderModule(key){
   const cfg = MODULES[key];
-  searchTerm = "";
-  activeFilters = {};
 
   const allRowsForFilters = DB[key].map(r => ({...r, ...(cfg.computeFn ? cfg.computeFn(r) : {})}));
   const filterBarHtml = cfg.filters ? cfg.filters.map(f => {
@@ -1288,6 +1316,7 @@ function renderModule(key){
 
   let currentFilteredRows = [];
   paint();
+  moduleRepaint = { key, paint };
 
   function paint(){
     let rows = DB[key].map(r => ({...r, ...(cfg.computeFn ? cfg.computeFn(r) : {})}));
@@ -2176,8 +2205,23 @@ function catalogCard(c){
 }
 
 /* ==========================================================================
-   USUARIOS Y ROLES (solo visible/editable con rol "admin")
+   USUARIOS Y ROLES (solo visible con rol "admin" o "superadmin")
    ========================================================================== */
+function rolLabelUsuario(rol){
+  if(rol === "superadmin") return "Super usuario";
+  if(rol === "admin") return "Administrador";
+  return "Operador/despachador";
+}
+function rolBadgeClass(rol){
+  if(rol === "superadmin") return "badge-accent";
+  if(rol === "admin") return "badge-ok";
+  return "badge-neutral";
+}
+// Una cuenta está "protegida" para el admin que NO es superadmin: no puede
+// editarla ni eliminarla (el backend rechaza igual, esto solo evita mostrar
+// botones que van a fallar).
+const usuarioProtegido = u => (u.rol === "superadmin" || u.rol === "admin") && !isSuperAdmin() && u.id !== currentAdmin.id;
+
 function renderUsuarios(){
   if(!isFullAdmin()){
     // Defensa extra en el front por si alguien fuerza el hash de navegación:
@@ -2190,8 +2234,9 @@ function renderUsuarios(){
       <div><span class="eyebrow">Configuración</span><h1>👤 Usuarios y roles</h1></div>
       <button class="btn btn-accent" id="btnAddUsuario">+ Nuevo usuario</button>
     </div>
-    <p style="color:var(--ink-soft); max-width:640px; margin-bottom:18px;">
-      <b>Administrador</b>: acceso total, incluida esta pantalla y la restauración de respaldos completos.
+    <p style="color:var(--ink-soft); max-width:680px; margin-bottom:18px;">
+      <b>Super usuario</b>: acceso total y exclusivo — es la única cuenta que puede crear/editar/eliminar Administradores u otros Super usuarios, y la única que puede ejecutar el borrado total del sistema.
+      <b>Administrador</b>: acceso total al día a día (todos los módulos, catálogos, usuarios operador) y a la restauración de respaldos, pero no puede tocar cuentas de Administrador ni de Super usuario.
       <b>Operador/despachador</b>: gestiona fletes, rutas, flota, conductores e incidencias del día a día, pero no ve esta sección.
     </p>
     <div id="usuariosWrap"><div class="empty-state"><div class="big">⏳</div>Cargando usuarios…</div></div>
@@ -2208,22 +2253,30 @@ async function loadUsuarios(){
   const rows = data.rows || [];
   if(!rows.length){ wrap.innerHTML = `<div class="empty-state"><div class="big">👤</div>Sin usuarios registrados.</div>`; return; }
   wrap.innerHTML = `<table><thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th></th></tr></thead><tbody>
-    ${rows.map(u => `
+    ${rows.map(u => {
+      const protegido = usuarioProtegido(u);
+      const esUnoMismo = u.id === currentAdmin.id;
+      return `
       <tr>
         <td>${esc(u.nombre)}</td>
         <td>${esc(u.email)}</td>
-        <td><span class="badge ${u.rol==='admin'?'badge-ok':'badge-neutral'}">${u.rol==='admin'?'Administrador':'Operador/despachador'}</span></td>
+        <td><span class="badge ${rolBadgeClass(u.rol)}">${rolLabelUsuario(u.rol)}</span></td>
         <td class="actions"><div class="row-actions">
-          <button class="icon-btn" data-edit-usuario="${u.id}" title="Editar">✎</button>
-          ${u.id === currentAdmin.id ? "" : `<button class="icon-btn danger" data-del-usuario="${u.id}" title="Eliminar">✕</button>`}
+          ${protegido
+            ? `<span class="badge badge-neutral" title="Solo el Super Usuario puede modificar esta cuenta">🔒</span>`
+            : `<button class="icon-btn" data-edit-usuario="${u.id}" title="Editar">✎</button>
+               ${esUnoMismo ? "" : `<button class="icon-btn danger" data-del-usuario="${u.id}" title="Eliminar">✕</button>`}`}
         </div></td>
-      </tr>`).join("")}
+      </tr>`;
+    }).join("")}
   </tbody></table>`;
   $$('[data-edit-usuario]', wrap).forEach(b => b.addEventListener('click', () => openUsuarioForm(rows.find(u => String(u.id) === b.dataset.editUsuario))));
   $$('[data-del-usuario]', wrap).forEach(b => b.addEventListener('click', () => confirmDeleteUsuario(rows.find(u => String(u.id) === b.dataset.delUsuario))));
 }
 
 function openUsuarioForm(existing){
+  if(existing && usuarioProtegido(existing)){ toast("Solo el Super Usuario puede modificar esta cuenta."); return; }
+  const rolActual = existing ? existing.rol : "operador";
   $("#modalRoot").innerHTML = `
     <div class="overlay" id="overlay">
       <div class="modal" style="max-width:440px">
@@ -2234,9 +2287,11 @@ function openUsuarioForm(existing){
           <div class="field">
             <label>Rol</label>
             <select id="uRol">
-              <option value="operador" ${existing && existing.rol!=='admin' ? "selected":""}>Operador / despachador</option>
-              <option value="admin" ${existing && existing.rol==='admin' ? "selected":""}>Administrador</option>
+              <option value="operador" ${rolActual==='operador' ? "selected":""}>Operador / despachador</option>
+              ${(isSuperAdmin() || rolActual==='admin') ? `<option value="admin" ${rolActual==='admin' ? "selected":""}>Administrador</option>` : ""}
+              ${isSuperAdmin() ? `<option value="superadmin" ${rolActual==='superadmin' ? "selected":""}>Super usuario</option>` : ""}
             </select>
+            ${!isSuperAdmin() ? `<small class="hint">Solo el Super Usuario puede asignar el rol Administrador o Super usuario.</small>` : ""}
           </div>
           <div class="field">
             <label>${existing ? "Nueva contraseña (dejar en blanco para no cambiarla)" : "Contraseña"}</label>
@@ -2275,6 +2330,7 @@ function openUsuarioForm(existing){
 
 function confirmDeleteUsuario(u){
   if(!u) return;
+  if(usuarioProtegido(u)){ toast("Solo el Super Usuario puede eliminar esa cuenta."); return; }
   $("#modalRoot").innerHTML = `
     <div class="overlay" id="overlay">
       <div class="modal" style="max-width:420px">
@@ -2348,16 +2404,47 @@ function renderNotifPanel(){
     </div>`).join("");
 }
 
+/**
+ * Calcula top/left en px para que el panel (position:fixed, ver css) quede
+ * siempre completo dentro de la pantalla, sin importar el ancho de la
+ * sidebar ni el tamaño del dispositivo. Se recalcula cada vez que se abre
+ * y también en resize mientras está abierto (por si el usuario gira el
+ * celular o cambia el tamaño de la ventana).
+ */
+function positionNotifPanel(btn, panel){
+  const margin = 10;
+  const btnRect = btn.getBoundingClientRect();
+  const panelWidth = panel.offsetWidth || 320;
+  // Se ancla por el borde izquierdo de la campanita, así el panel se abre
+  // hacia la derecha (hacia el contenido principal) en vez de hacia la
+  // izquierda, que es donde termina la pantalla.
+  let left = btnRect.left;
+  left = Math.max(margin, Math.min(left, window.innerWidth - panelWidth - margin));
+  let top = btnRect.bottom + 8;
+  const maxTop = window.innerHeight - margin - 60; // deja algo de aire abajo
+  top = Math.min(top, maxTop);
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+}
+
 function initNotifBell(){
   const btn = $("#btnNotifBell");
   const panel = $("#notifPanel");
   if(!btn || !panel) return;
+  // La sidebar usa position:sticky, lo que crea su propio contexto de
+  // apilamiento y "atrapa" a sus descendientes — incluido este panel,
+  // aunque sea position:fixed con z-index alto. El contenido de .main
+  // (tarjetas KPI, etc.), al no estar contenido en ese contexto, termina
+  // pintándose por encima. Moviendo el panel a document.body, queda fuera
+  // de la sidebar y se pinta siempre por encima de todo el contenido.
+  document.body.appendChild(panel);
   btn.addEventListener("click", async (e) => {
     e.stopPropagation();
     const opening = panel.hidden;
     panel.hidden = !panel.hidden;
     if(opening){
       renderNotifPanel();
+      positionNotifPanel(btn, panel);
       if(notifState.noLeidas > 0){
         await apiFetch("notificaciones/marcar_leidas.php", { method: "POST" });
         notifState.rows.forEach(n => n.leida = true);
@@ -2368,6 +2455,9 @@ function initNotifBell(){
   });
   document.addEventListener("click", (e) => {
     if(!panel.hidden && !panel.contains(e.target) && e.target !== btn) panel.hidden = true;
+  });
+  window.addEventListener("resize", () => {
+    if(!panel.hidden) positionNotifPanel(btn, panel);
   });
 }
 
@@ -2892,10 +2982,14 @@ async function handleImportFile(file, targetModule){
   if(result.type === "json"){
     const payload = result.payload;
     if(payload && payload.data && payload.catalogos){
-      // Restaurar un respaldo completo SÍ reemplaza toda la base — pero es
-      // una acción explícita y deliberada del usuario (no un efecto
-      // secundario de guardar un registro suelto), así que usa su propia
-      // función que calcula la diferencia real contra el servidor.
+      // Restaurar un respaldo completo reemplaza TODA la base de datos —
+      // igual de irreversible que el borrado total, así que queda
+      // reservado exclusivamente al Super Usuario. El backend no valida
+      // esto por sí mismo (llega como una serie de guardados/borrados
+      // normales por tabla), así que el freno principal está acá.
+      if(!isSuperAdmin()){
+        throw new Error("Solo el Super Usuario puede restaurar un respaldo completo.");
+      }
       await restoreFullBackup(payload);
       return { added:0, skipped:0, duplicated:0, backup:true };
     }
@@ -3068,7 +3162,7 @@ async function startApp(admin){
 
   currentAdmin = admin || null;
   const email = admin?.email || "";
-  const rolLabel = admin?.rol === "admin" ? "Administrador" : "Operador/despachador";
+  const rolLabel = rolLabelUsuario(admin?.rol);
   const sessionLabel = $("#adminSession");
   if(sessionLabel) sessionLabel.textContent = email ? `Sesión: ${email} · ${rolLabel}` : "";
 
@@ -3153,7 +3247,7 @@ function watchRutasRealtime(){
       if(error){ console.error("Error al refrescar rutas", error); return; }
       DB.rutas = data || [];
       await syncClosedRoutesToFletes();
-      if(["rutas", "dashboard", "fletes"].includes(currentModule)) renderMain();
+      if(["rutas", "dashboard", "fletes"].includes(currentModule)) refreshModuleData();
     } finally {
       reloading = false;
     }

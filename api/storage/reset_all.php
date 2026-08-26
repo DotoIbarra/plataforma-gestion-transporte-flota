@@ -1,6 +1,9 @@
 <?php
 require_once __DIR__ . '/../auth.php';
-require_role_admin();
+// Borra TODOS los módulos operativos de forma irreversible: reservado
+// exclusivamente para el Super Usuario, ni siquiera un Administrador puede
+// ejecutar esto.
+require_role_superadmin();
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     json_error('Método no permitido', 405);
