@@ -9,9 +9,9 @@ const COLUMNS = [
     'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'estadoServicio', 'conductor',
     'origen', 'destino', 'fotoInicio', 'fotoFin', 'pesoCarga', 'costoPorKg',
     'observaciones', 'obra', 'solicitadoPor', 'nroRepor', 'nroGuia',
-    'conductor_user_id',
+    'conductor_user_id', 'kilometraje',
 ];
-const NUMERIC_COLS = ['nro', 'pesoCarga', 'costoPorKg', 'conductor_user_id'];
+const NUMERIC_COLS = ['nro', 'pesoCarga', 'costoPorKg', 'conductor_user_id', 'kilometraje'];
 const DATE_COLS = ['fechaSalida', 'fechaLlegada'];
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {

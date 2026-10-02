@@ -8,7 +8,7 @@ const COLUMNS = [
     'nro', 'fechaSalida', 'fechaLlegada', 'placa', 'estado', 'estadoServicio', 'conductor',
     'origen', 'destino', 'fotoInicio', 'fotoFin', 'pesoCarga', 'costoPorKg',
     'observaciones', 'obra', 'solicitadoPor', 'nroRepor', 'nroGuia',
-    'conductor_user_id', 'lat', 'lng', 'ubicacionTs',
+    'conductor_user_id', 'lat', 'lng', 'ubicacionTs', 'kilometraje',
 ];
 
 json_response(['rows' => list_rows(TABLE, COLUMNS)]);

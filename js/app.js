@@ -310,6 +310,8 @@ async function loadDB(){
     else { DB[key] = data || []; }
   }));
 
+  await loadReportes();
+
   const { data, error } = await apiFetch("storage/get_all.php");
   if(error){ console.error("Error al conectar con la base de datos", error); toast("Error al conectar con la base de datos"); }
   const map = data ? { [LS_CAT]: data.catalogos, [LS_TRASH]: data.trash, [LS_LOG]: data.log } : {};
@@ -617,6 +619,7 @@ const MODULES = {
       { key:"nroRepor", label:"N° Report", kind:"text" },
       { key:"nroGuia", label:"N° GUIA", kind:"text" },
       { key:"pesoCarga", label:"Peso carga (Kg)", kind:"number", numeric:true },
+      { key:"kilometraje", label:"Kilómetros recorridos", kind:"number", numeric:true },
       { key:"costoPorKg", label:"Costo x Kg ($)", kind:"number", numeric:true, money:true },
       { key:"ingresoTotal", label:"Ingreso total ($)", kind:"computed", numeric:true, money:true },
       { key:"estadoRuta", label:"Estado", kind:"computed", badge:true },
@@ -761,7 +764,12 @@ function renderSidebar(){
       <span class="ico">📍</span><span>Mapa operacional</span>
       <span class="count">${rutasActivasConUbicacion().length}</span></button>
     <button class="nav-item ${currentModule==='historialOps'?'active':''}" data-nav="historialOps">
-      <span class="ico">🕓</span><span>Historial de operaciones</span></button>`;
+      <span class="ico">🕓</span><span>Historial de operaciones</span></button>
+    <button class="nav-item ${currentModule==='reportes'?'active':''}" data-nav="reportes">
+      <span class="ico">🗂️</span><span>Centro de reportes</span>
+      <span class="count">${(DB.reportes||[]).filter(r=>(r.estado||"Pendiente")!=="Resuelto").length}</span></button>
+    <button class="nav-item ${currentModule==='recordConductor'?'active':''}" data-nav="recordConductor">
+      <span class="ico">🏁</span><span>Historial de viajes (Record)</span></button>`;
 
   html += `<div class="nav-group-label">Configuración</div>
     <button class="nav-item ${currentModule==='catalogos'?'active':''}" data-nav="catalogos">
@@ -858,6 +866,8 @@ function renderMain(){
   if(currentModule === "facturas") return renderFacturas();
   if(currentModule === "mapa") return renderMapa();
   if(currentModule === "historialOps") return renderHistorialOperaciones();
+  if(currentModule === "reportes") return renderCentroReportes();
+  if(currentModule === "recordConductor") return renderHistorialConductor();
   return renderModule(currentModule);
 }
 
@@ -872,12 +882,64 @@ function ultimosNMeses(n){
   return out;
 }
 
+/* ---- filtro global de fechas del Panel general ---- */
+let dashFilter = { preset: "mes", from: null, to: null }; // dia | semana | mes | anio | custom
+
+function dashRange(){
+  const toISO = d => d.toISOString().slice(0,10);
+  const now = new Date();
+  if(dashFilter.preset === "custom"){
+    return { from: dashFilter.from || toISO(now), to: dashFilter.to || toISO(now) };
+  }
+  let from;
+  if(dashFilter.preset === "dia") from = new Date(now);
+  else if(dashFilter.preset === "semana"){ from = new Date(now); from.setDate(from.getDate()-6); }
+  else if(dashFilter.preset === "anio") from = new Date(now.getFullYear(), 0, 1);
+  else from = new Date(now.getFullYear(), now.getMonth(), 1); // mes (default)
+  return { from: toISO(from), to: toISO(now) };
+}
+function dashRangeLabel(){
+  const labels = { dia:"Hoy", semana:"Últimos 7 días", mes:"Este mes", anio:"Este año", custom:"Rango personalizado" };
+  return labels[dashFilter.preset] || "Este mes";
+}
+function inDashRange(fecha){
+  if(!fecha) return false;
+  const r = dashRange();
+  return fecha >= r.from && fecha <= r.to;
+}
+function dashFilterBarHTML(){
+  const presets = [["dia","Día"],["semana","Semana"],["mes","Mes"],["anio","Año"],["custom","Rango"]];
+  const r = dashRange();
+  return `<div class="dash-filterbar">
+    <div class="seg-group" id="dashPresetGroup">
+      ${presets.map(([k,l])=>`<button class="seg-btn ${dashFilter.preset===k?'active':''}" data-dashpreset="${k}">${l}</button>`).join("")}
+    </div>
+    ${dashFilter.preset === "custom" ? `
+      <input type="date" id="dashFrom" value="${dashFilter.from || r.from}">
+      <span class="dash-filter-sep">—</span>
+      <input type="date" id="dashTo" value="${dashFilter.to || r.to}">
+    ` : `<span class="dash-range-label">${fmtDate(r.from)} – ${fmtDate(r.to)}</span>`}
+  </div>`;
+}
+
+/* ---- búsqueda rápida global (vehículos, conductores, rutas, incidencias) ---- */
+function dashSearchResults(term){
+  if(!term || term.trim().length < 2) return [];
+  const t = term.trim().toLowerCase();
+  const out = [];
+  DB.flota.forEach(r=>{ if((r.placa||"").toLowerCase().includes(t) || (r.marca||"").toLowerCase().includes(t) || (r.modelo||"").toLowerCase().includes(t)) out.push({module:"flota", nro:r.nro, label:`${r.placa||"—"} · ${r.marca||""} ${r.modelo||""}`, icon:"🚚"}); });
+  DB.conductores.forEach(r=>{ const n=`${r.nombres||""} ${r.apellidos||""}`.trim(); if(n.toLowerCase().includes(t)) out.push({module:"conductores", nro:r.nro, label:n, icon:"🧑‍✈️"}); });
+  DB.rutas.forEach(r=>{ if((r.obra||"").toLowerCase().includes(t) || (r.origen||"").toLowerCase().includes(t) || (r.destino||"").toLowerCase().includes(t) || (r.conductor||"").toLowerCase().includes(t)) out.push({module:"rutas", nro:r.nro, label:`${r.origen||"?"} → ${r.destino||"?"} · ${r.conductor||""}`, icon:"🗺️"}); });
+  DB.incidencias.forEach(r=>{ if((r.tipo||"").toLowerCase().includes(t) || (r.placa||"").toLowerCase().includes(t) || (r.conductor||"").toLowerCase().includes(t)) out.push({module:"incidencias", nro:r.nro, label:`${r.tipo||"Incidencia"} · ${r.placa||r.conductor||""}`, icon:"⚠️"}); });
+  return out.slice(0,8);
+}
+
 function barChartHTML(data, opts={}){
   const max = Math.max(1, ...data.map(d=>d.value));
   const fmt = opts.money ? (v)=>"$ "+fmtMoney(v) : (v)=>fmtNum(v);
   return `<div class="bar-chart">
     ${data.map(d=>`
-      <div class="bar-chart-col">
+      <div class="bar-chart-col ${opts.clickable?'bar-chart-col-click':''}" ${opts.clickable?`data-monthkey="${esc(d.key||d.label)}" data-monthlabel="${esc(d.label)}" tabindex="0" role="button"`:""}>
         <span class="bar-chart-value">${d.value ? fmt(d.value) : ""}</span>
         <div class="bar-chart-track"><div class="bar-chart-bar" style="height:${d.value ? Math.max(4,Math.round((d.value/max)*100)) : 0}%" title="${esc(d.label)}: ${fmt(d.value)}"></div></div>
         <span class="bar-chart-label">${esc(d.label)}</span>
@@ -889,14 +951,60 @@ function hbarListHTML(rows, opts={}){
   const max = Math.max(1, ...rows.map(r=>r.value));
   if(!rows.length) return `<div class="empty-note">${esc(opts.emptyLabel || "Sin datos todavía.")}</div>`;
   return rows.map(r => `
-    <div class="hbar-row">
+    <div class="hbar-row ${opts.clickKey?'hbar-row-click':''}" ${opts.clickKey?`data-label="${esc(r.label)}" tabindex="0" role="button"`:""}>
       <span class="hbar-label" title="${esc(r.label)}">${esc(r.label)}</span>
       <div class="hbar-track"><div class="hbar-fill" style="width:${Math.max(4,Math.round((r.value/max)*100))}%; --c:${r.color || 'var(--accent)'}"></div></div>
       <b class="hbar-value">${r.value}</b>
     </div>`).join("");
 }
 
+/* Modal genérico de "drill-down": reutiliza renderTable() y las mismas
+   acciones de editar/eliminar que el módulo real, para poder gestionar
+   los datos sin salir del Panel general. */
+function openDashDrilldown({ title, subtitle, cfg, rows, moduleKey }){
+  $("#modalRoot").innerHTML = `
+    <div class="overlay" id="overlay">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <div><div class="dash-breadcrumb">${esc(subtitle||"")}</div><h3>${esc(title)}</h3></div>
+          <button class="modal-close" id="modalClose">✕</button>
+        </div>
+        <div class="modal-body">
+          ${rows.length ? renderTable(cfg, rows) : `<div class="empty-state"><div class="big">${cfg.icon}</div>Sin registros para este filtro.</div>`}
+        </div>
+        <div class="modal-foot">
+          <span class="count-pill">${rows.length} registro(s)</span>
+          <span class="spacer"></span>
+          <button class="btn btn-accent" id="btnGoModule">Ver módulo completo → ${esc(cfg.label)}</button>
+        </div>
+      </div>
+    </div>`;
+  $("#modalClose").addEventListener("click", closeModal);
+  $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
+  $("#btnGoModule").addEventListener("click", () => { closeModal(); goTo(moduleKey); });
+  $$("[data-edit]").forEach(b => b.addEventListener("click", () => { closeModal(); openForm(moduleKey, b.dataset.edit); }));
+  $$("[data-del]").forEach(b => b.addEventListener("click", () => confirmDelete(moduleKey, b.dataset.del)));
+}
+
+/* Traduce el clic en una tarjeta KPI del Panel general al drill-down que
+   corresponde (según el módulo y el filtro de fecha activo). */
+function openDashKpiDrilldown(key, ctx){
+  const map = {
+    flota: { title:"Vehículos en flota", subtitle:"Panel general › Vehículos en flota", cfg: MODULES.flota, rows: DB.flota, moduleKey:"flota" },
+    ingresos: { title:`Ingresos · ${dashRangeLabel()}`, subtitle:"Panel general › Ingresos › "+dashRangeLabel(), cfg: MODULES.rutas, rows: ctx.rutasEnRango, moduleKey:"rutas" },
+    seguros: { title:"Seguros por vencer / vencidos", subtitle:"Panel general › Seguros › Por vencer o vencidos", cfg: MODULES.seguros, rows: ctx.porVencer, moduleKey:"seguros" },
+    multas: { title:"Multas por pagar", subtitle:"Panel general › Multas › Pendientes", cfg: MODULES.multas, rows: ctx.multasPendientes, moduleKey:"multas" },
+    fletes: { title:`Fletes · ${dashRangeLabel()}`, subtitle:"Panel general › Fletes › "+dashRangeLabel(), cfg: MODULES.fletes, rows: ctx.fletesEnRango, moduleKey:"fletes" },
+    mantenimiento: { title:"Mantenimientos en curso", subtitle:"Panel general › Mantenimiento › En curso", cfg: MODULES.mantenimiento, rows: ctx.mantenimientosEnCurso, moduleKey:"mantenimiento" },
+    incidencias: { title:"Incidencias abiertas", subtitle:"Panel general › Incidencias › Abiertas / en revisión", cfg: MODULES.incidencias, rows: ctx.incidenciasAbiertas, moduleKey:"incidencias" },
+  };
+  const cfgOpt = map[key];
+  if(cfgOpt) openDashDrilldown(cfgOpt);
+}
+
 function renderDashboard(){
+  const range = dashRange();
+
   const totalVehiculos = DB.flota.length;
   const disponibles = DB.flota.filter(r=>r.estado==="Disponible").length;
 
@@ -908,9 +1016,13 @@ function renderDashboard(){
   const totalDeuda = multasPendientes.reduce((a,r)=>a+r.debe,0);
 
   const rutasCalc = DB.rutas.map(r=>({...r, ...computeRuta(r)}));
-  const ingresoTotal = rutasCalc.reduce((a,r)=>a+r.ingresoTotal,0);
+  const rutasEnRango = rutasCalc.filter(r => inDashRange(r.fechaLlegada || r.fechaSalida));
+  const ingresoRango = rutasEnRango.reduce((a,r)=>a+(r.ingresoTotal||0),0);
 
-  const mantenimientosEnCurso = DB.mantenimiento.filter(m => m.fechaEntrada && !m.fechaSalida).length;
+  const fletesCalc = DB.fletes.map(r=>({...r, ...(typeof computeFlete === "function" ? computeFlete(r) : {})}));
+  const fletesEnRango = fletesCalc.filter(r => inDashRange(r.realizado));
+
+  const mantenimientosEnCurso = DB.mantenimiento.filter(m => m.fechaEntrada && !m.fechaSalida);
 
   const incidenciasAbiertas = DB.incidencias.filter(i => i.estado === "Abierta" || i.estado === "En revisión");
   const incidenciasCriticas = incidenciasAbiertas.filter(i => i.gravedad === "Alta" || i.gravedad === "Crítica");
@@ -926,13 +1038,15 @@ function renderDashboard(){
   // ---- ingresos por mes (últimos 6 meses, según rutas) ----
   const meses6 = ultimosNMeses(6);
   const ingresosPorMesMap = {};
+  const rutasPorMesKey = {};
   rutasCalc.forEach(r=>{
     const fecha = r.fechaLlegada || r.fechaSalida;
     if(!fecha) return;
     const key = fecha.slice(0,7);
     ingresosPorMesMap[key] = (ingresosPorMesMap[key]||0) + (r.ingresoTotal||0);
+    (rutasPorMesKey[key] = rutasPorMesKey[key] || []).push(r);
   });
-  const ingresosChart = meses6.map(m => ({ label:m.label, value: Math.round(ingresosPorMesMap[m.key]||0) }));
+  const ingresosChart = meses6.map(m => ({ key:m.key, label:m.label, value: Math.round(ingresosPorMesMap[m.key]||0) }));
 
   // ---- estado de la flota ----
   const estadoColors = { "Disponible":"var(--success)", "En ruta":"var(--accent)", "En taller":"var(--warning)", "Fuera de servicio":"var(--danger)" };
@@ -942,9 +1056,9 @@ function renderDashboard(){
     .sort((a,b)=>b[1]-a[1])
     .map(([label,value])=>({ label, value, color: estadoColors[label] || "var(--route)" }));
 
-  // ---- top obras (por cantidad de fletes) ----
+  // ---- top obras (por cantidad de fletes, dentro del rango elegido) ----
   const obraCounts = {};
-  DB.fletes.forEach(f=>{ const o = (f.obra||"").trim(); if(!o) return; obraCounts[o] = (obraCounts[o]||0) + 1; });
+  fletesEnRango.forEach(f=>{ const o = (f.obra||"").trim(); if(!o) return; obraCounts[o] = (obraCounts[o]||0) + 1; });
   const topObras = Object.entries(obraCounts).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([label,value])=>({label, value}));
 
   // ---- actividad reciente ----
@@ -952,36 +1066,53 @@ function renderDashboard(){
 
   $("#main").innerHTML = `
     <div class="topbar">
-      <div><span class="eyebrow">Hoy · ${fmtDate(todayISO())}</span><h1>Panel general de flota</h1></div>
+      <div><span class="eyebrow">Hoy · ${fmtDate(todayISO())}</span><h1>Centro de operaciones</h1></div>
       <div class="topbar-actions">
         <button class="btn" id="btnExport">⭳ Exportar</button>
         <button class="btn" id="btnImport">⭱ Importar</button>
       </div>
     </div>
 
-    <div class="kpi-grid">
-      <div class="kpi" style="--kpi-color:var(--accent)"><div class="label">Vehículos en flota</div><div class="value">${String(totalVehiculos).padStart(2,"0")}</div><div class="sub">${disponibles} disponibles</div></div>
-      <div class="kpi ${porVencer.length?'warn':''}" style="--kpi-color:${porVencer.length?'var(--warning)':'var(--success)'}"><div class="label">Seguros por vencer/vencidos</div><div class="value">${String(porVencer.length).padStart(2,"0")}</div><div class="sub">próx. 30 días o vencidos</div></div>
-      <div class="kpi ${multasPendientes.length?'danger':''}" style="--kpi-color:${multasPendientes.length?'var(--danger)':'var(--success)'}"><div class="label">Multas por pagar</div><div class="value">$ ${fmtMoney(totalDeuda)}</div><div class="sub">${multasPendientes.length} pendiente(s)</div></div>
-      <div class="kpi" style="--kpi-color:var(--route)"><div class="label">Fletes registrados</div><div class="value">${String(DB.fletes.length).padStart(2,"0")}</div><div class="sub">${DB.rutas.length} rutas de viaje</div></div>
-      <div class="kpi ${mantenimientosEnCurso?'warn':''}" style="--kpi-color:${mantenimientosEnCurso?'var(--warning)':'var(--success)'}"><div class="label">Mantenimientos en curso</div><div class="value">${String(mantenimientosEnCurso).padStart(2,"0")}</div><div class="sub">vehículos en taller</div></div>
-      <div class="kpi ${incidenciasAbiertas.length?'danger':''}" style="--kpi-color:${incidenciasAbiertas.length?'var(--danger)':'var(--success)'}"><div class="label">Incidencias abiertas</div><div class="value">${String(incidenciasAbiertas.length).padStart(2,"0")}</div><div class="sub">${incidenciasCriticas.length} de gravedad alta/crítica</div></div>
+    <div class="dash-searchbar">
+      <div class="search-box dash-search"><input id="dashSearch" placeholder="Buscar vehículo, conductor, ruta, obra…" autocomplete="off"></div>
+      <div class="dash-search-results" id="dashSearchResults"></div>
+    </div>
+
+    <div class="dash-quickbar">
+      <span class="dash-quick-label">Accesos rápidos:</span>
+      <button class="chip-btn" data-quick="rutas">+ Ruta</button>
+      <button class="chip-btn" data-quick="flota">+ Vehículo</button>
+      <button class="chip-btn" data-quick="conductores">+ Conductor</button>
+      <button class="chip-btn" data-quick="mantenimiento">+ Mantenimiento</button>
+      <button class="chip-btn" data-quick="incidencias">+ Incidencia</button>
+      <span class="spacer"></span>
+      ${dashFilterBarHTML()}
+    </div>
+
+    <div class="kpi-grid" id="dashKpiGrid">
+      <div class="kpi kpi-click" data-dash="flota" tabindex="0" role="button" style="--kpi-color:var(--accent)"><div class="label">Vehículos en flota</div><div class="value">${String(totalVehiculos).padStart(2,"0")}</div><div class="sub">${disponibles} disponibles · estado actual</div></div>
+      <div class="kpi kpi-click" data-dash="ingresos" tabindex="0" role="button" style="--kpi-color:var(--success)"><div class="label">Ingresos · ${esc(dashRangeLabel())}</div><div class="value">$ ${fmtMoney(ingresoRango)}</div><div class="sub">${rutasEnRango.length} ruta(s) en el período</div></div>
+      <div class="kpi kpi-click ${porVencer.length?'warn':''}" data-dash="seguros" tabindex="0" role="button" style="--kpi-color:${porVencer.length?'var(--warning)':'var(--success)'}"><div class="label">Seguros por vencer/vencidos</div><div class="value">${String(porVencer.length).padStart(2,"0")}</div><div class="sub">próx. 30 días o vencidos · estado actual</div></div>
+      <div class="kpi kpi-click ${multasPendientes.length?'danger':''}" data-dash="multas" tabindex="0" role="button" style="--kpi-color:${multasPendientes.length?'var(--danger)':'var(--success)'}"><div class="label">Multas por pagar</div><div class="value">$ ${fmtMoney(totalDeuda)}</div><div class="sub">${multasPendientes.length} pendiente(s) · estado actual</div></div>
+      <div class="kpi kpi-click" data-dash="fletes" tabindex="0" role="button" style="--kpi-color:var(--route)"><div class="label">Fletes · ${esc(dashRangeLabel())}</div><div class="value">${String(fletesEnRango.length).padStart(2,"0")}</div><div class="sub">${DB.rutas.length} rutas totales</div></div>
+      <div class="kpi kpi-click ${mantenimientosEnCurso.length?'warn':''}" data-dash="mantenimiento" tabindex="0" role="button" style="--kpi-color:${mantenimientosEnCurso.length?'var(--warning)':'var(--success)'}"><div class="label">Mantenimientos en curso</div><div class="value">${String(mantenimientosEnCurso.length).padStart(2,"0")}</div><div class="sub">vehículos en taller · estado actual</div></div>
+      <div class="kpi kpi-click ${incidenciasAbiertas.length?'danger':''}" data-dash="incidencias" tabindex="0" role="button" style="--kpi-color:${incidenciasAbiertas.length?'var(--danger)':'var(--success)'}"><div class="label">Incidencias abiertas</div><div class="value">${String(incidenciasAbiertas.length).padStart(2,"0")}</div><div class="sub">${incidenciasCriticas.length} de gravedad alta/crítica</div></div>
     </div>
 
     <div class="dash-grid dash-grid-3">
       <div class="panel">
-        <h3><span class="ico">📈</span> Ingresos por mes (rutas)</h3>
-        ${barChartHTML(ingresosChart, { money:true })}
+        <h3><span class="ico">📈</span> Ingresos por mes (rutas) <span class="panel-hint">clic en una barra para ver el detalle</span></h3>
+        ${barChartHTML(ingresosChart, { money:true, clickable:true })}
       </div>
 
       <div class="panel">
         <h3><span class="ico">🚚</span> Estado de la flota</h3>
-        <div class="hbar-list">${hbarListHTML(estadoRows, { emptyLabel:"Sin vehículos registrados." })}</div>
+        <div class="hbar-list" id="hbarEstadoFlota">${hbarListHTML(estadoRows, { emptyLabel:"Sin vehículos registrados.", clickKey:"estado" })}</div>
       </div>
 
       <div class="panel">
         <h3><span class="ico">🧭</span> Servicios activos por estado</h3>
-        <div class="hbar-list">${hbarListHTML(servicioRows, { emptyLabel:"Sin servicios en curso." })}</div>
+        <div class="hbar-list" id="hbarServicios">${hbarListHTML(servicioRows, { emptyLabel:"Sin servicios en curso.", clickKey:"servicio" })}</div>
       </div>
     </div>
 
@@ -989,30 +1120,30 @@ function renderDashboard(){
       <div class="panel">
         <h3><span class="ico">🔔</span> Atención requerida</h3>
         ${porVencer.map(r=>`
-          <div class="mini-row"><span>${plateChip(r.placa)} póliza ${esc(r.aseguradora)}</span><span class="tag ${r.estadoPoliza==='Vencido'?'tag-danger':'tag-warn'}">${r.estadoPoliza}</span></div>`).join("") }
+          <div class="mini-row mini-row-click" data-openrow="seguros:${r.nro}"><span>${plateChip(r.placa)} póliza ${esc(r.aseguradora)}</span><span class="tag ${r.estadoPoliza==='Vencido'?'tag-danger':'tag-warn'}">${r.estadoPoliza}</span></div>`).join("") }
         ${multasPendientes.map(r=>`
-          <div class="mini-row"><span>${plateChip(r.placa)} multa ${esc(r.infraccion)}</span><span class="tag tag-danger">Debe $ ${fmtMoney(r.debe)}</span></div>`).join("") }
+          <div class="mini-row mini-row-click" data-openrow="multas:${r.nro}"><span>${plateChip(r.placa)} multa ${esc(r.infraccion)}</span><span class="tag tag-danger">Debe $ ${fmtMoney(r.debe)}</span></div>`).join("") }
         ${(!porVencer.length && !multasPendientes.length) ? `<div class="empty-note">Todo en orden. Sin pendientes por ahora.</div>` : ""}
       </div>
 
       <div class="panel">
         <h3><span class="ico">⚠️</span> Incidencias abiertas</h3>
         ${incidenciasAbiertas.slice(0,6).map(r=>`
-          <div class="mini-row"><span>${plateChip(r.placa || "—")} ${esc(r.tipo||"")}</span><span class="tag ${(r.gravedad==='Alta'||r.gravedad==='Crítica')?'tag-danger':'tag-warn'}">${esc(r.gravedad||r.estado)}</span></div>`).join("") }
+          <div class="mini-row mini-row-click" data-openrow="incidencias:${r.nro}"><span>${plateChip(r.placa || "—")} ${esc(r.tipo||"")}</span><span class="tag ${(r.gravedad==='Alta'||r.gravedad==='Crítica')?'tag-danger':'tag-warn'}">${esc(r.gravedad||r.estado)}</span></div>`).join("") }
         ${!incidenciasAbiertas.length ? `<div class="empty-note">Sin incidencias abiertas.</div>` : ""}
       </div>
     </div>
 
     <div class="dash-grid">
       <div class="panel">
-        <h3><span class="ico">🏗️</span> Top obras (por fletes)</h3>
-        <div class="hbar-list">${hbarListHTML(topObras, { emptyLabel:"Sin fletes registrados todavía." })}</div>
+        <h3><span class="ico">🏗️</span> Top obras (por fletes · ${esc(dashRangeLabel())})</h3>
+        <div class="hbar-list" id="hbarObras">${hbarListHTML(topObras, { emptyLabel:"Sin fletes registrados en el período.", clickKey:"obra" })}</div>
       </div>
 
       <div class="panel">
         <h3><span class="ico">🕘</span> Actividad reciente</h3>
         ${actividadReciente.length ? actividadReciente.map(e => `
-          <div class="mini-row">
+          <div class="mini-row mini-row-click" data-gomodule="${e.moduleKey}">
             <span>${esc(MODULES[e.moduleKey] ? MODULES[e.moduleKey].label : e.moduleKey)} — ${esc(e.summary || "#"+e.nro)}</span>
             <span class="tag ${e.action==='delete'?'tag-danger':e.action==='create'?'tag-ok':'tag-warn'}">${esc(ACTION_LABELS[e.action] || e.action)}</span>
           </div>`).join("") : `<div class="empty-note">Sin actividad registrada todavía.</div>`}
@@ -1021,6 +1152,386 @@ function renderDashboard(){
   `;
   $("#btnExport").addEventListener("click", ()=> openExportModal(null));
   $("#btnImport").addEventListener("click", ()=> openImportModal(null));
+
+  // ---- accesos rápidos ----
+  $$("[data-quick]").forEach(b => b.addEventListener("click", () => { const mod = b.dataset.quick; goTo(mod); openForm(mod, null); }));
+
+  // ---- filtro de fecha global ----
+  $$("[data-dashpreset]").forEach(b => b.addEventListener("click", () => {
+    dashFilter.preset = b.dataset.dashpreset;
+    if(dashFilter.preset === "custom" && !dashFilter.from){ const r = dashRange(); dashFilter.from = r.from; dashFilter.to = r.to; }
+    renderDashboard();
+  }));
+  const fromInput = $("#dashFrom"), toInput = $("#dashTo");
+  if(fromInput) fromInput.addEventListener("change", e => { dashFilter.from = e.target.value; renderDashboard(); });
+  if(toInput) toInput.addEventListener("change", e => { dashFilter.to = e.target.value; renderDashboard(); });
+
+  // ---- búsqueda rápida global ----
+  const dashSearchInput = $("#dashSearch");
+  dashSearchInput.addEventListener("input", e => {
+    const results = dashSearchResults(e.target.value);
+    $("#dashSearchResults").innerHTML = results.length ? results.map(r=>`
+      <button class="dash-search-item" data-goresult="${r.module}:${r.nro}"><span class="ico">${r.icon}</span> ${esc(r.label)} <span class="dash-search-mod">${esc(MODULES[r.module]?.label||r.module)}</span></button>`).join("") : "";
+    $$("[data-goresult]").forEach(b => b.addEventListener("click", () => {
+      const [mod,nro] = b.dataset.goresult.split(":");
+      goTo(mod);
+      openForm(mod, nro);
+    }));
+  });
+  document.addEventListener("click", function dashSearchOutside(e){
+    if(!e.target.closest(".dash-searchbar")){ const r=$("#dashSearchResults"); if(r) r.innerHTML=""; }
+  }, { once:true });
+
+  // ---- KPIs clicables -> drill-down ----
+  const kpiCtx = { rutasEnRango, fletesEnRango, porVencer, multasPendientes, mantenimientosEnCurso, incidenciasAbiertas };
+  $$("[data-dash]").forEach(el => {
+    const open = () => openDashKpiDrilldown(el.dataset.dash, kpiCtx);
+    el.addEventListener("click", open);
+    el.addEventListener("keydown", e => { if(e.key === "Enter" || e.key === " "){ e.preventDefault(); open(); } });
+  });
+
+  // ---- barras del gráfico de ingresos -> drill-down por mes ----
+  $$(".bar-chart-col[data-monthkey]").forEach(col => {
+    const open = () => {
+      const rows = rutasPorMesKey[col.dataset.monthkey] || [];
+      openDashDrilldown({ title:`Ingresos · ${col.dataset.monthlabel}`, subtitle:`Panel general › Ingresos por mes › ${col.dataset.monthlabel}`, cfg: MODULES.rutas, rows, moduleKey:"rutas" });
+    };
+    col.addEventListener("click", open);
+    col.addEventListener("keydown", e => { if(e.key === "Enter" || e.key === " "){ e.preventDefault(); open(); } });
+  });
+
+  // ---- filas de gráficos hbar -> drill-down ----
+  $$("#hbarEstadoFlota .hbar-row").forEach(row => row.addEventListener("click", () => {
+    const label = row.dataset.label;
+    openDashDrilldown({ title:`Vehículos · ${label}`, subtitle:`Panel general › Estado de la flota › ${label}`, cfg: MODULES.flota, rows: DB.flota.filter(v => (v.estado||"Sin estado") === label), moduleKey:"flota" });
+  }));
+  $$("#hbarServicios .hbar-row").forEach(row => row.addEventListener("click", () => {
+    const label = row.dataset.label;
+    openDashDrilldown({ title:`Servicios · ${label}`, subtitle:`Panel general › Servicios activos › ${label}`, cfg: MODULES.rutas, rows: serviciosActivos.filter(r => (r.estadoServicio||"Asignado") === label), moduleKey:"rutas" });
+  }));
+  $$("#hbarObras .hbar-row").forEach(row => row.addEventListener("click", () => {
+    const label = row.dataset.label;
+    openDashDrilldown({ title:`Fletes · ${label}`, subtitle:`Panel general › Top obras › ${label}`, cfg: MODULES.fletes, rows: fletesEnRango.filter(f => (f.obra||"").trim() === label), moduleKey:"fletes" });
+  }));
+
+  // ---- alertas y actividad -> directo al registro / módulo ----
+  $$("[data-openrow]").forEach(row => row.addEventListener("click", () => {
+    const [mod, nro] = row.dataset.openrow.split(":");
+    goTo(mod);
+    openForm(mod, nro);
+  }));
+  $$("[data-gomodule]").forEach(row => row.addEventListener("click", () => goTo(row.dataset.gomodule)));
+}
+
+/* ==========================================================================
+   CENTRO DE REPORTES — incidencias e inconsistencias del propio sistema
+   (conductores, vehículos, rutas, viajes, datos faltantes, problemas
+   administrativos). Tabla independiente `reportes`: no participa del
+   pipeline genérico de módulos (MODULE_ORDER / _dirty), tiene sus propios
+   endpoints (api/reportes/*.php) con guardado directo.
+   ========================================================================== */
+const REPORTE_CATEGORIAS = ["Conductores","Vehículos","Rutas","Viajes","Información inconsistente","Datos faltantes","Problemas administrativos","Otro"];
+const REPORTE_PRIORIDADES = ["Baja","Media","Alta","Crítica"];
+const REPORTE_ESTADOS = ["Pendiente","En revisión","Resuelto"];
+
+function safeParseJSON(v, fallback){
+  if(v && typeof v === "object") return v;
+  if(!v) return fallback;
+  try{ const p = JSON.parse(v); return p ?? fallback; } catch(e){ return fallback; }
+}
+
+async function loadReportes(){
+  const { data, error } = await apiFetch("reportes/list.php");
+  if(error){ console.error("Error al cargar reportes", error); DB.reportes = []; return; }
+  DB.reportes = (data.rows || []).map(r => ({
+    ...r,
+    comentarios: safeParseJSON(r.comentarios, []),
+    historial: safeParseJSON(r.historial, []),
+  }));
+}
+
+let reportesFilters = { categoria:"", prioridad:"" };
+
+function renderCentroReportes(){
+  $("#main").innerHTML = `
+    <div class="topbar">
+      <div><span class="eyebrow">Seguimiento</span><h1>🗂️ Centro de reportes</h1></div>
+      <div class="topbar-actions">
+        <button class="btn btn-accent" id="btnNuevoReporte">+ Nuevo reporte</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <select class="filter-select" id="repFiltroCategoria">
+        <option value="">Categoría: Todas</option>
+        ${REPORTE_CATEGORIAS.map(c=>`<option value="${esc(c)}" ${reportesFilters.categoria===c?'selected':''}>${esc(c)}</option>`).join("")}
+      </select>
+      <select class="filter-select" id="repFiltroPrioridad">
+        <option value="">Prioridad: Todas</option>
+        ${REPORTE_PRIORIDADES.map(p=>`<option value="${esc(p)}" ${reportesFilters.prioridad===p?'selected':''}>${esc(p)}</option>`).join("")}
+      </select>
+      <span class="spacer"></span>
+      <span class="count-pill">${DB.reportes.length} reporte(s)</span>
+    </div>
+    <div class="report-board" id="reportBoard"></div>
+  `;
+  $("#btnNuevoReporte").addEventListener("click", () => openReportForm(null));
+  $("#repFiltroCategoria").addEventListener("change", e => { reportesFilters.categoria = e.target.value; paintReportBoard(); });
+  $("#repFiltroPrioridad").addEventListener("change", e => { reportesFilters.prioridad = e.target.value; paintReportBoard(); });
+  paintReportBoard();
+  moduleRepaint = { key:"reportes", paint: paintReportBoard };
+}
+
+function paintReportBoard(){
+  let rows = DB.reportes.slice().sort((a,b) => (b.fecha||"").localeCompare(a.fecha||"") || (b.nro-a.nro));
+  if(reportesFilters.categoria) rows = rows.filter(r => r.categoria === reportesFilters.categoria);
+  if(reportesFilters.prioridad) rows = rows.filter(r => r.prioridad === reportesFilters.prioridad);
+
+  const board = $("#reportBoard");
+  if(!board) return;
+  board.innerHTML = REPORTE_ESTADOS.map(estado => {
+    const col = rows.filter(r => (r.estado||"Pendiente") === estado);
+    return `<div class="report-col">
+      <h4>${esc(estado)} <span class="count-pill">${col.length}</span></h4>
+      ${col.length ? col.map(r => `
+        <div class="report-card" data-report="${r.nro}">
+          <div class="rc-title">${esc(r.categoria||"Otro")}</div>
+          <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:6px;">${esc((r.descripcion||"").slice(0,90))}${(r.descripcion||"").length>90?"…":""}</div>
+          <div class="rc-meta"><span class="priority-${esc((r.prioridad||"media").toLowerCase())}">● ${esc(r.prioridad||"Media")}</span><span>${fmtDate(r.fecha)}</span></div>
+        </div>`).join("") : `<div class="empty-note">Sin reportes.</div>`}
+    </div>`;
+  }).join("");
+  $$("[data-report]").forEach(card => card.addEventListener("click", () => {
+    const rep = DB.reportes.find(r => String(r.nro) === card.dataset.report);
+    if(rep) openReportDetail(rep);
+  }));
+}
+
+function openReportForm(row){
+  const editing = !!row;
+  $("#modalRoot").innerHTML = `
+    <div class="overlay" id="overlay">
+      <div class="modal" style="max-width:560px">
+        <div class="modal-head"><h3>${editing?"Editar reporte":"Nuevo reporte"}</h3><button class="modal-close" id="modalClose">✕</button></div>
+        <div class="modal-body">
+          <div class="form-grid">
+            <div class="form-field"><label>Categoría *</label>
+              <select id="repCategoria">${REPORTE_CATEGORIAS.map(c=>`<option value="${esc(c)}" ${row?.categoria===c?'selected':''}>${esc(c)}</option>`).join("")}</select>
+            </div>
+            <div class="form-field"><label>Prioridad *</label>
+              <select id="repPrioridad">${REPORTE_PRIORIDADES.map(p=>`<option value="${esc(p)}" ${(row?.prioridad||"Media")===p?'selected':''}>${esc(p)}</option>`).join("")}</select>
+            </div>
+            <div class="form-field"><label>Fecha</label><input type="date" id="repFecha" value="${row?.fecha || todayISO()}"></div>
+            <div class="form-field"><label>Reportado por</label><input type="text" id="repUsuario" value="${esc(row?.usuarioReporta || (currentAdmin?.nombre || currentAdmin?.email || ""))}"></div>
+            <div class="form-field span2"><label>Descripción *</label><textarea id="repDescripcion" rows="4">${esc(row?.descripcion||"")}</textarea></div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" id="btnCancel">Cancelar</button>
+          <button class="btn btn-accent" id="btnSaveReporte">Guardar</button>
+        </div>
+      </div>
+    </div>`;
+  $("#modalClose").addEventListener("click", closeModal);
+  $("#btnCancel").addEventListener("click", closeModal);
+  $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
+  $("#btnSaveReporte").addEventListener("click", async () => {
+    const descripcion = $("#repDescripcion").value.trim();
+    if(!descripcion){ toast("La descripción es obligatoria"); return; }
+    const payload = {
+      nro: row?.nro,
+      categoria: $("#repCategoria").value,
+      prioridad: $("#repPrioridad").value,
+      fecha: $("#repFecha").value,
+      usuarioReporta: $("#repUsuario").value.trim(),
+      descripcion,
+    };
+    const { data, error } = await apiFetch("reportes/save.php", { method:"POST", body: payload });
+    if(error){ toast("Error al guardar el reporte"); return; }
+    const saved = { ...data.row, comentarios: safeParseJSON(data.row.comentarios, []), historial: safeParseJSON(data.row.historial, []) };
+    const idx = DB.reportes.findIndex(r => r.nro === saved.nro);
+    if(idx === -1) DB.reportes.unshift(saved); else DB.reportes[idx] = saved;
+    closeModal();
+    toast(editing ? "Reporte actualizado" : "Reporte creado");
+    if(currentModule === "reportes") paintReportBoard();
+    renderSidebar();
+  });
+}
+
+function openReportDetail(rep){
+  $("#modalRoot").innerHTML = `
+    <div class="overlay" id="overlay">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <div><div class="dash-breadcrumb">Centro de reportes › ${esc(rep.categoria||"Otro")}</div><h3>Reporte #${rep.nro}</h3></div>
+          <button class="modal-close" id="modalClose">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="margin-bottom:12px;">${esc(rep.descripcion||"")}</p>
+          <div class="mini-row"><span>Prioridad</span><span class="tag priority-${esc((rep.prioridad||"media").toLowerCase())}">${esc(rep.prioridad||"Media")}</span></div>
+          <div class="mini-row"><span>Fecha</span><span>${fmtDate(rep.fecha)}</span></div>
+          <div class="mini-row"><span>Reportado por</span><span>${esc(rep.usuarioReporta||"—")}</span></div>
+          <div class="mini-row"><span>Estado</span><span>
+            <select id="repEstadoSelect">${REPORTE_ESTADOS.map(e=>`<option value="${esc(e)}" ${(rep.estado||"Pendiente")===e?'selected':''}>${esc(e)}</option>`).join("")}</select>
+          </span></div>
+          <h4 style="margin:16px 0 6px;font-size:13px;">Historial de cambios</h4>
+          <ul class="status-history">${(rep.historial||[]).map(h=>`<li>${fmtDateTime(h.fecha)} — ${esc(h.usuario||"")}: ${esc(h.accion||"")}</li>`).join("") || "<li>Sin historial.</li>"}</ul>
+          <h4 style="margin:16px 0 6px;font-size:13px;">Comentarios</h4>
+          <div id="repComentarios">${(rep.comentarios||[]).map(c=>`<div class="comment-item"><div class="comment-meta">${esc(c.usuario||"")} · ${fmtDateTime(c.fecha)}</div>${esc(c.texto||"")}</div>`).join("") || `<div class="empty-note">Sin comentarios todavía.</div>`}</div>
+          <div style="display:flex;gap:8px;margin-top:10px;">
+            <input type="text" id="repNuevoComentario" placeholder="Escribir un comentario…" style="flex:1">
+            <button class="btn" id="btnAddComentario">Comentar</button>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-danger" id="btnDelReporte">Eliminar</button>
+          <span class="spacer"></span>
+          <button class="btn" id="btnCloseReporte">Cerrar</button>
+        </div>
+      </div>
+    </div>`;
+  $("#modalClose").addEventListener("click", closeModal);
+  $("#btnCloseReporte").addEventListener("click", closeModal);
+  $("#overlay").addEventListener("click", e => { if(e.target.id === "overlay") closeModal(); });
+  $("#repEstadoSelect").addEventListener("change", async e => {
+    const nuevoEstado = e.target.value;
+    const usuario = currentAdmin?.nombre || currentAdmin?.email || "Admin";
+    const { data, error } = await apiFetch("reportes/estado.php", { method:"POST", body:{ nro:rep.nro, estado:nuevoEstado, usuario } });
+    if(error){ toast("Error al cambiar el estado"); return; }
+    rep.estado = data.estado; rep.historial = data.historial;
+    const idx = DB.reportes.findIndex(r=>r.nro===rep.nro); if(idx!==-1) DB.reportes[idx] = rep;
+    toast("Estado actualizado");
+    openReportDetail(rep);
+    if(currentModule === "reportes") paintReportBoard();
+    renderSidebar();
+  });
+  $("#btnAddComentario").addEventListener("click", async () => {
+    const texto = $("#repNuevoComentario").value.trim();
+    if(!texto) return;
+    const usuario = currentAdmin?.nombre || currentAdmin?.email || "Admin";
+    const { data, error } = await apiFetch("reportes/comentar.php", { method:"POST", body:{ nro:rep.nro, texto, usuario } });
+    if(error){ toast("Error al comentar"); return; }
+    rep.comentarios = data.comentarios;
+    const idx = DB.reportes.findIndex(r=>r.nro===rep.nro); if(idx!==-1) DB.reportes[idx] = rep;
+    openReportDetail(rep);
+  });
+  $("#btnDelReporte").addEventListener("click", async () => {
+    if(!confirm(`¿Eliminar el reporte #${rep.nro}?`)) return;
+    const { error } = await apiFetch("reportes/delete.php", { method:"POST", body:{ nro:rep.nro } });
+    if(error){ toast("Error al eliminar"); return; }
+    DB.reportes = DB.reportes.filter(r=>r.nro!==rep.nro);
+    closeModal();
+    toast("Reporte eliminado");
+    if(currentModule === "reportes") paintReportBoard();
+    renderSidebar();
+  });
+}
+
+/* ==========================================================================
+   HISTORIAL DE VIAJES ("Record") — desempeño de cada conductor
+   ========================================================================== */
+let recordFilter = { conductorId: "", preset: "mes", from: null, to: null };
+
+function recordRange(){
+  const toISO = d => d.toISOString().slice(0,10);
+  const now = new Date();
+  if(recordFilter.preset === "custom") return { from: recordFilter.from || toISO(now), to: recordFilter.to || toISO(now) };
+  let from;
+  if(recordFilter.preset === "dia") from = new Date(now);
+  else if(recordFilter.preset === "semana"){ from = new Date(now); from.setDate(from.getDate()-6); }
+  else if(recordFilter.preset === "anio") from = new Date(now.getFullYear(),0,1);
+  else from = new Date(now.getFullYear(), now.getMonth(), 1);
+  return { from: toISO(from), to: toISO(now) };
+}
+function inRangeStr(fecha, range){ if(!fecha) return false; return fecha >= range.from && fecha <= range.to; }
+
+function renderHistorialConductor(){
+  const nombres = [...new Set(DB.conductores.map(c => `${c.nombres||""} ${c.apellidos||""}`.trim()).filter(Boolean))];
+  $("#main").innerHTML = `
+    <div class="topbar">
+      <div><span class="eyebrow">Seguimiento</span><h1>🏁 Historial de viajes (Record)</h1></div>
+    </div>
+    <div class="toolbar">
+      <select class="filter-select" id="recConductor">
+        <option value="">Todos los conductores</option>
+        ${nombres.map(n=>`<option value="${esc(n)}" ${recordFilter.conductorId===n?'selected':''}>${esc(n)}</option>`).join("")}
+      </select>
+      <div class="seg-group">
+        ${[["dia","Día"],["semana","Semana"],["mes","Mes"],["anio","Año"],["custom","Rango"]].map(([k,l])=>`<button class="seg-btn ${recordFilter.preset===k?'active':''}" data-recpreset="${k}">${l}</button>`).join("")}
+      </div>
+      ${recordFilter.preset === "custom" ? `
+        <input type="date" id="recFrom" value="${recordFilter.from || recordRange().from}">
+        <span class="dash-filter-sep">—</span>
+        <input type="date" id="recTo" value="${recordFilter.to || recordRange().to}">
+      ` : `<span class="dash-range-label">${fmtDate(recordRange().from)} – ${fmtDate(recordRange().to)}</span>`}
+    </div>
+    <div id="recordBody"></div>
+  `;
+  $("#recConductor").addEventListener("change", e => { recordFilter.conductorId = e.target.value; renderHistorialConductor(); });
+  $$("[data-recpreset]").forEach(b => b.addEventListener("click", () => {
+    recordFilter.preset = b.dataset.recpreset;
+    if(recordFilter.preset === "custom" && !recordFilter.from){ const r = recordRange(); recordFilter.from = r.from; recordFilter.to = r.to; }
+    renderHistorialConductor();
+  }));
+  const fromInput = $("#recFrom"), toInput = $("#recTo");
+  if(fromInput) fromInput.addEventListener("change", e => { recordFilter.from = e.target.value; renderHistorialConductor(); });
+  if(toInput) toInput.addEventListener("change", e => { recordFilter.to = e.target.value; renderHistorialConductor(); });
+
+  paintRecordBody();
+  moduleRepaint = { key:"recordConductor", paint: paintRecordBody };
+}
+
+function paintRecordBody(){
+  const range = recordRange();
+  const rutasCalc = DB.rutas.map(r => ({...r, ...computeRuta(r)}));
+  let rows = rutasCalc.filter(r => inRangeStr(r.fechaLlegada || r.fechaSalida, range));
+  if(recordFilter.conductorId) rows = rows.filter(r => (r.conductor||"") === recordFilter.conductorId);
+
+  const totalViajes = rows.length;
+  const km = rows.reduce((a,r)=>a+(Number(r.kilometraje)||0),0);
+  const ingresos = rows.reduce((a,r)=>a+(r.ingresoTotal||0),0);
+  const diasEnRuta = rows.reduce((a,r)=>{ if(r.fechaSalida && r.fechaLlegada){ return a + Math.max(daysBetween(r.fechaSalida, r.fechaLlegada), 0) + 1; } return a; }, 0);
+  const vehiculosUsados = [...new Set(rows.map(r=>r.placa).filter(Boolean))];
+
+  const diasPeriodo = Math.max(1, daysBetween(range.from, range.to) + 1);
+  const promedioSemanal = (totalViajes / diasPeriodo * 7).toFixed(1);
+
+  const meses6 = ultimosNMeses(6);
+  let baseHist = rutasCalc;
+  if(recordFilter.conductorId) baseHist = baseHist.filter(r => (r.conductor||"") === recordFilter.conductorId);
+  const viajesPorMes = {}, ingresosPorMes = {};
+  baseHist.forEach(r=>{
+    const fecha = r.fechaLlegada || r.fechaSalida; if(!fecha) return;
+    const key = fecha.slice(0,7);
+    viajesPorMes[key] = (viajesPorMes[key]||0)+1;
+    ingresosPorMes[key] = (ingresosPorMes[key]||0)+(r.ingresoTotal||0);
+  });
+  const viajesChart = meses6.map(m=>({ label:m.label, value: viajesPorMes[m.key]||0 }));
+  const ingresosChart = meses6.map(m=>({ label:m.label, value: Math.round(ingresosPorMes[m.key]||0) }));
+
+  $("#recordBody").innerHTML = `
+    <div class="record-kpi-grid">
+      <div class="record-kpi"><div class="label">Viajes realizados</div><div class="value">${totalViajes}</div></div>
+      <div class="record-kpi"><div class="label">Kilómetros recorridos*</div><div class="value">${fmtNum(km)}</div></div>
+      <div class="record-kpi"><div class="label">Tiempo estimado en ruta*</div><div class="value">${diasEnRuta} día(s)</div></div>
+      <div class="record-kpi"><div class="label">Ingresos generados</div><div class="value">$ ${fmtMoney(ingresos)}</div></div>
+      <div class="record-kpi"><div class="label">Promedio de viajes / semana</div><div class="value">${promedioSemanal}</div></div>
+      <div class="record-kpi"><div class="label">Vehículos utilizados</div><div class="value">${vehiculosUsados.length}</div></div>
+    </div>
+    <div class="dash-grid dash-grid-3">
+      <div class="panel"><h3><span class="ico">📈</span> Viajes por mes</h3>${barChartHTML(viajesChart)}</div>
+      <div class="panel"><h3><span class="ico">💰</span> Ingresos por mes</h3>${barChartHTML(ingresosChart, {money:true})}</div>
+      <div class="panel"><h3><span class="ico">🚚</span> Vehículos utilizados</h3>
+        ${vehiculosUsados.length ? vehiculosUsados.map(p=>`<div class="mini-row"><span>${plateChip(p)}</span></div>`).join("") : `<div class="empty-note">Sin vehículos en el período.</div>`}
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="ico">🗺️</span> Rutas realizadas en el período</h3>
+      ${rows.length ? renderTable(MODULES.rutas, rows) : `<div class="empty-note">Sin viajes en el período seleccionado.</div>`}
+    </div>
+    <p style="font-size:11.5px;color:var(--ink-faint);margin-top:10px;">*Kilómetros: campo opcional que se carga al registrar cada ruta. Tiempo en ruta: estimado a partir de la fecha de salida y de llegada — el sistema todavía no registra horas exactas de conducción.</p>
+  `;
+  $$("[data-edit]").forEach(b=> b.addEventListener('click', ()=> openForm("rutas", b.dataset.edit)));
+  $$("[data-del]").forEach(b=> b.addEventListener('click', ()=> confirmDelete("rutas", b.dataset.del)));
 }
 
 function plateChip(placa){
@@ -2068,7 +2579,7 @@ async function renderAuditoria(){
   if(error){ $("#auditTableWrap").innerHTML = `<div class="empty-state">No se pudo cargar la auditoría.</div>`; return; }
   auditoriaCache = data.rows || [];
 
-  const ACCION_LABELS = { create:"Creado", update:"Actualizado", cambio_estado:"Cambio de estado" };
+  const ACCION_LABELS = { create:"Creado", update:"Actualizado", cambio_estado:"Cambio de estado", login:"Inicio de sesión", logout:"Cierre de sesión" };
   $("#auditTableWrap").innerHTML = auditoriaCache.length ? `
     <table><thead><tr><th>Fecha</th><th>Actor</th><th>Acción</th><th>Entidad</th><th>Detalle</th></tr></thead><tbody>
       ${auditoriaCache.map(a => `<tr>
@@ -2222,6 +2733,36 @@ function rolBadgeClass(rol){
 // botones que van a fallar).
 const usuarioProtegido = u => (u.rol === "superadmin" || u.rol === "admin") && !isSuperAdmin() && u.id !== currentAdmin.id;
 
+// Presencia (#26): "conectado"/"ausente" los calcula el backend a partir del
+// último heartbeat (ver api/usuarios/list.php); acá solo se traduce a
+// texto/color y se formatea "hace cuánto" para "desconectado".
+const ESTADO_LABELS = { conectado: "Conectado", ausente: "Ausente", desconectado: "Desconectado" };
+const ESTADO_DOT = { conectado: "#22c55e", ausente: "#f59e0b", desconectado: "#9aa1ac" };
+
+function fmtUltimaConexion(iso){
+  if(!iso) return "Nunca ha iniciado sesión";
+  const d = new Date(iso.replace(" ", "T"));
+  if(isNaN(d)) return "—";
+  const diffMin = Math.round((Date.now() - d.getTime()) / 60000);
+  if(diffMin < 1) return "hace instantes";
+  if(diffMin < 60) return `hace ${diffMin} min`;
+  const diffH = Math.round(diffMin / 60);
+  if(diffH < 24) return `hace ${diffH} h`;
+  const diffD = Math.round(diffH / 24);
+  if(diffD < 30) return `hace ${diffD} día${diffD===1?"":"s"}`;
+  return d.toLocaleDateString("es-CL", { day:"2-digit", month:"2-digit", year:"numeric" });
+}
+
+function estadoUsuarioHTML(u){
+  const estado = u.estado || "desconectado";
+  const dot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${ESTADO_DOT[estado]};margin-right:6px;"></span>`;
+  const label = ESTADO_LABELS[estado] || estado;
+  const detalle = estado === "desconectado"
+    ? `<div class="empty-note" style="margin-top:2px;">${esc(fmtUltimaConexion(u.ultima_conexion))}</div>`
+    : "";
+  return `<div>${dot}${esc(label)}</div>${detalle}`;
+}
+
 function renderUsuarios(){
   if(!isFullAdmin()){
     // Defensa extra en el front por si alguien fuerza el hash de navegación:
@@ -2243,6 +2784,13 @@ function renderUsuarios(){
   `;
   $("#btnAddUsuario").addEventListener("click", () => openUsuarioForm(null));
   loadUsuarios();
+  // Refresca solo la columna "Estado" cada 15s mientras esta pantalla esté
+  // abierta, para que conectado/ausente/desconectado se vea al día sin
+  // necesidad de recargar la página. Se detiene solo al salir de la pantalla.
+  clearInterval(window.__usuariosPresenceTimer);
+  window.__usuariosPresenceTimer = setInterval(() => {
+    if(currentModule === "usuarios") loadUsuarios(); else clearInterval(window.__usuariosPresenceTimer);
+  }, 15000);
 }
 
 async function loadUsuarios(){
@@ -2252,7 +2800,7 @@ async function loadUsuarios(){
   if(error){ wrap.innerHTML = `<div class="empty-state"><div class="big">⚠️</div>No se pudo cargar la lista de usuarios.</div>`; return; }
   const rows = data.rows || [];
   if(!rows.length){ wrap.innerHTML = `<div class="empty-state"><div class="big">👤</div>Sin usuarios registrados.</div>`; return; }
-  wrap.innerHTML = `<table><thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th></th></tr></thead><tbody>
+  wrap.innerHTML = `<table><thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody>
     ${rows.map(u => {
       const protegido = usuarioProtegido(u);
       const esUnoMismo = u.id === currentAdmin.id;
@@ -2261,6 +2809,7 @@ async function loadUsuarios(){
         <td>${esc(u.nombre)}</td>
         <td>${esc(u.email)}</td>
         <td><span class="badge ${rolBadgeClass(u.rol)}">${rolLabelUsuario(u.rol)}</span></td>
+        <td>${estadoUsuarioHTML(u)}</td>
         <td class="actions"><div class="row-actions">
           ${protegido
             ? `<span class="badge badge-neutral" title="Solo el Super Usuario puede modificar esta cuenta">🔒</span>`
@@ -3128,6 +3677,39 @@ function openImportModal(moduleKey){
 }
 
 /* ==========================================================================
+   PRESENCIA (#26) — heartbeat de "estoy aquí" para que Usuarios pueda
+   mostrar conectado / ausente / desconectado + última conexión.
+   No decide nada por su cuenta: solo reporta al backend cada HEARTBEAT_MS
+   si hubo movimiento de mouse/teclado en los últimos AUSENTE_MS; el
+   backend (api/usuarios/list.php) es quien decide el estado final,
+   comparando esto contra el tiempo real transcurrido.
+   ========================================================================== */
+const HEARTBEAT_MS = 20000;   // cada cuánto se avisa al backend
+const AUSENTE_MS = 5 * 60000; // sin mover el mouse/teclado esto = "ausente"
+let _lastActivityAt = Date.now();
+let _heartbeatTimer = null;
+
+function markActivity(){ _lastActivityAt = Date.now(); }
+
+function startPresenceHeartbeat(){
+  if(_heartbeatTimer) return; // ya estaba corriendo
+  ["mousemove", "mousedown", "keydown", "touchstart", "scroll"].forEach(ev =>
+    document.addEventListener(ev, markActivity, { passive: true })
+  );
+  const tick = () => {
+    const status = (Date.now() - _lastActivityAt >= AUSENTE_MS) ? "ausente" : "activo";
+    apiFetch("heartbeat.php", { method: "POST", body: { status } }).catch(() => {});
+  };
+  tick();
+  _heartbeatTimer = setInterval(tick, HEARTBEAT_MS);
+}
+
+function stopPresenceHeartbeat(){
+  clearInterval(_heartbeatTimer);
+  _heartbeatTimer = null;
+}
+
+/* ==========================================================================
    LOGIN DE ADMINISTRADOR
    ========================================================================== */
 // El panel debe iniciar sesión para poder leer y escribir: cada endpoint de
@@ -3181,7 +3763,9 @@ async function startApp(admin){
   initNotifBell();
   loadNotifications();
   setInterval(loadNotifications, 30000);
+  startPresenceHeartbeat();
   $("#btnLogout").addEventListener("click", async () => {
+    stopPresenceHeartbeat();
     await apiFetch("logout.php", { method: "POST" });
     _appStarted = false;
     currentAdmin = null;

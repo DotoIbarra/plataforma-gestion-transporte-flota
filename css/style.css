@@ -733,3 +733,185 @@ td.actions{ text-align:right; white-space:nowrap; }
 .admin-session{
   font-size:11px; color:var(--navy-ink-dim); margin:10px 0 6px; word-break:break-all;
 }
+/* ============================================================
+   DASHBOARD INTERACTIVO — búsqueda rápida, accesos, filtro de
+   fecha global y drill-down (Panel general)
+   ============================================================ */
+.dash-searchbar{ position:relative; margin-bottom:14px; }
+.dash-search input{ width:100%; }
+.dash-search-results{
+  position:absolute; top:calc(100% + 6px); left:0; right:0; z-index:40;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow); max-height:320px; overflow:auto;
+}
+.dash-search-item{
+  display:flex; align-items:center; gap:8px; width:100%; text-align:left;
+  padding:9px 12px; border:none; background:none; cursor:pointer; font-size:13px;
+  border-bottom:1px solid var(--border); color:var(--ink);
+}
+.dash-search-item:last-child{ border-bottom:none; }
+.dash-search-item:hover{ background:var(--accent-soft); }
+.dash-search-mod{ margin-left:auto; font-size:11px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:.4px; }
+
+/* ---- Accesos rápidos ----
+   La barra ahora es una franja con su propio contenedor (mismo lenguaje
+   que .panel) y los botones son acciones reales: fondo azul suave en
+   reposo, azul de ruta sólido al pasar el cursor. */
+.dash-quickbar{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:18px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-sm); padding:10px 14px;
+}
+.dash-quick-label{
+  align-self:stretch; display:inline-flex; align-items:center;
+  padding-right:14px; margin-right:2px; border-right:1px solid var(--border);
+  font-size:11.5px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.6px; font-weight:700;
+  white-space:nowrap;
+}
+.chip-btn{
+  display:inline-flex; align-items:center; gap:8px;
+  min-height:36px; padding:8px 14px; border-radius:8px;
+  border:1px solid rgba(0,88,160,.22); background:var(--accent-soft); color:var(--accent-dark);
+  font-family:inherit; font-size:13px; font-weight:600; line-height:1.2; white-space:nowrap;
+  cursor:pointer;
+  transition:background .14s ease, color .14s ease, border-color .14s ease,
+             box-shadow .14s ease, transform .14s ease;
+}
+.chip-btn .ico{ font-size:15px; line-height:1; width:18px; text-align:center; }
+.chip-btn:active{ transform:translateY(1px); background:var(--accent-dark); border-color:var(--accent-dark); color:#fff; }
+/* variante destacada: la acción más usada, ya en azul sólido */
+.chip-btn.primary{ background:var(--accent); border-color:var(--accent-dark); color:#fff; }
+.chip-btn.primary:active{ background:var(--accent-dark); }
+/* el efecto hover solo en dispositivos con puntero, para que en celular
+   no quede "pegado" el color después de tocar */
+@media (hover:hover){
+  .chip-btn:hover{
+    background:var(--accent); border-color:var(--accent-dark); color:#fff;
+    box-shadow:0 6px 14px -6px rgba(0,88,160,.6); transform:translateY(-1px);
+  }
+  .chip-btn.primary:hover{ background:var(--accent-dark); }
+}
+@media (pointer:coarse){ .chip-btn{ min-height:42px; } }
+
+.dash-filterbar{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.seg-group{ display:flex; border:1px solid var(--border); border-radius:20px; overflow:hidden; }
+.seg-btn{ border:none; background:var(--surface); padding:6px 12px; font-size:12px; font-weight:600; cursor:pointer; color:var(--ink-soft); }
+.seg-btn + .seg-btn{ border-left:1px solid var(--border); }
+.seg-btn.active{ background:var(--accent); color:#fff; }
+.dash-range-label{ font-size:12px; color:var(--ink-faint); white-space:nowrap; }
+.dash-filter-sep{ color:var(--ink-faint); }
+
+.kpi-click{ cursor:pointer; transition:transform .15s ease, box-shadow .15s ease; }
+.kpi-click:hover{ transform:translateY(-2px); box-shadow:0 10px 22px -10px rgba(0,0,0,.22); }
+.kpi-click:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+.bar-chart-col-click{ cursor:pointer; border-radius:8px; transition:background .15s ease; }
+.bar-chart-col-click:hover, .bar-chart-col-click:focus-visible{ background:var(--accent-soft); outline:none; }
+
+.hbar-row-click{ cursor:pointer; border-radius:6px; padding:3px 4px; margin:0 -4px; transition:background .15s ease; }
+.hbar-row-click:hover, .hbar-row-click:focus-visible{ background:var(--accent-soft); outline:none; }
+
+.mini-row-click{ cursor:pointer; border-radius:6px; padding:9px 6px; margin:0 -6px; transition:background .15s ease; }
+.mini-row-click:hover{ background:var(--accent-soft); }
+
+.panel h3{ justify-content:space-between; }
+.panel-hint{ font-size:10.5px; font-weight:500; color:var(--ink-faint); text-transform:none; letter-spacing:0; margin-left:auto; }
+
+.modal-wide{ max-width:960px; width:94vw; }
+.dash-breadcrumb{ font-size:11px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:.4px; margin-bottom:2px; }
+
+/* ---- Centro de reportes ---- */
+.report-board{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-bottom:18px; }
+.report-col{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:12px; min-height:120px; }
+.report-col h4{ font-size:12.5px; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-soft); margin-bottom:10px; display:flex; justify-content:space-between; }
+.report-card{ background:var(--bg); border:1px solid var(--border); border-radius:10px; padding:10px 12px; margin-bottom:8px; cursor:pointer; transition:box-shadow .15s ease, transform .15s ease; }
+.report-card:hover{ box-shadow:0 6px 16px -8px rgba(0,0,0,.2); transform:translateY(-1px); }
+.report-card .rc-title{ font-weight:700; font-size:13px; margin-bottom:4px; }
+.report-card .rc-meta{ font-size:11px; color:var(--ink-faint); display:flex; justify-content:space-between; gap:6px; }
+.priority-baja{ color:var(--success); }
+.priority-media{ color:var(--warning); }
+.priority-alta,.priority-critica{ color:var(--danger); }
+.comment-item{ border-bottom:1px solid var(--border); padding:8px 0; font-size:13px; }
+.comment-item:last-child{ border-bottom:none; }
+.comment-meta{ font-size:11px; color:var(--ink-faint); margin-bottom:2px; }
+.status-history{ font-size:12px; color:var(--ink-soft); }
+.status-history li{ margin-bottom:4px; }
+
+/* ---- Historial / Record de conductor ---- */
+/* Cabecera del conductor (opcional): avatar con iniciales + datos + acciones.
+   Uso: <div class="record-head"><div class="record-avatar">JP</div>
+   <div class="record-head-info"><div class="record-head-name">…</div>
+   <div class="record-head-meta"><span>…</span></div></div>
+   <div class="record-head-actions">…</div></div> */
+.record-head{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:16px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-sm); padding:14px 18px;
+}
+.record-avatar{
+  width:46px; height:46px; border-radius:50%; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--accent); background-image:linear-gradient(155deg, var(--accent) 55%, var(--accent-dark) 100%);
+  color:var(--accent-ink); font-family:var(--font-display); font-weight:700; font-size:16px; letter-spacing:.3px;
+}
+.record-head-info{ flex:1; min-width:0; }
+.record-head-name{
+  font-family:var(--font-display); font-weight:700; font-size:17px; letter-spacing:-.01em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.record-head-meta{ display:flex; flex-wrap:wrap; gap:2px 14px; margin-top:2px; font-size:12.5px; color:var(--ink-soft); }
+.record-head-actions{ margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
+
+/* Tarjetas de resumen: versión compacta del talón de manifiesto (riel de
+   color a la izquierda, un dato grande, una línea de contexto). Se puede
+   cambiar el color con las clases .ok / .warn / .danger. */
+.record-kpi-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; margin-bottom:22px; }
+.record-kpi{
+  --rk-color:var(--accent);
+  position:relative; min-width:0; overflow:hidden;
+  display:flex; flex-direction:column; gap:6px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-sm); padding:14px 16px 14px 20px;
+}
+.record-kpi::before{
+  content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--rk-color);
+}
+.record-kpi .label{
+  font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--ink-soft); font-weight:700;
+}
+.record-kpi .value{
+  font-family:var(--font-mono); font-weight:700; font-size:24px; line-height:1.1; letter-spacing:.2px;
+  font-variant-numeric:tabular-nums; color:var(--ink);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.record-kpi .value small{
+  font-family:var(--font-body); font-size:12px; font-weight:600; color:var(--ink-faint); margin-left:4px; letter-spacing:0;
+}
+.record-kpi .sub{ font-size:11.5px; color:var(--ink-soft); }
+.record-kpi.ok{ --rk-color:var(--success); }
+.record-kpi.ok .value{ color:var(--success); }
+.record-kpi.warn{ --rk-color:var(--warning); }
+.record-kpi.warn .value{ color:var(--warning); }
+.record-kpi.danger{ --rk-color:var(--danger); }
+.record-kpi.danger .value{ color:var(--danger); }
+
+@media (max-width:900px){
+  .report-board{ grid-template-columns:1fr; }
+}
+@media (max-width:720px){
+  /* accesos rápidos: etiqueta arriba y botones en 2 columnas, fáciles de tocar */
+  .dash-quickbar{ gap:8px; padding:12px; }
+  .dash-quick-label{ width:100%; padding:0 0 2px; margin:0; border-right:none; }
+  .chip-btn{ flex:1 1 calc(50% - 4px); justify-content:center; white-space:normal; text-align:center; }
+  .modal-wide{ width:96vw; }
+  .record-kpi-grid{ grid-template-columns:repeat(2,1fr); gap:10px; }
+  /* si la cantidad de tarjetas es impar, la última ocupa todo el ancho */
+  .record-kpi-grid > .record-kpi:last-child:nth-child(odd){ grid-column:1 / -1; }
+  .record-head{ padding:12px 14px; }
+  .record-head-actions{ width:100%; margin-left:0; }
+  .record-head-actions .btn{ flex:1; justify-content:center; }
+}
+@media (max-width:480px){
+  .record-kpi{ padding:12px 12px 12px 16px; }
+  .record-kpi .value{ font-size:20px; }
+}

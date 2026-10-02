@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/auditoria.php';
 start_secure_session();
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -33,6 +34,20 @@ $_SESSION['admin_id'] = $admin['id'];
 $_SESSION['admin_email'] = $admin['email'];
 $_SESSION['admin_rol'] = $admin['rol'] ?: 'admin';
 $_SESSION['admin_nombre'] = $admin['nombre'] ?: $admin['email'];
+
+// Presencia: queda "conectado" desde ya (con heartbeat inicial), y la
+// sesión queda marcada como activa hasta que se llame a logout.php o el
+// heartbeat deje de llegar (ver heartbeat.php y api/usuarios/list.php).
+$stmtP = db()->prepare(
+    "UPDATE admin_users SET last_heartbeat_at = NOW(), last_activity_status = 'activo', sesion_activa = 1 WHERE id = ?"
+);
+$stmtP->bind_param('i', $admin['id']);
+$stmtP->execute();
+$stmtP->close();
+
+// Auditoría: queda constancia de quién inició sesión y cuándo (columna
+// creado_en de la tabla auditoria). Nunca debe tumbar el login si falla.
+audit('admin', $_SESSION['admin_nombre'], 'login', 'sesion', (int)$admin['id']);
 
 json_response([
     'ok' => true,
